@@ -484,6 +484,42 @@ func (it *CoreInteraction) Commands(i *interact.Interact) {
 		reply.Message(fmt.Sprintf("Position of strategy %s modified.", it.modifyPositionContext.signature))
 		return nil
 	})
+
+	// Read protective stop
+	i.PrivateCommand("/getprotectivestop", "Check Strategy Protective Stop Loss", func(reply interact.Reply) error {
+		// it.trader.exchangeStrategies
+		// send symbol options
+		if strategies, found := filterStrategyByField("ExitMethods", reflect.TypeOf(ExitMethodSet{}), it.exchangeStrategies); found {
+			reply.AddMultipleButtons(generateStrategyButtonsForm(strategies))
+			reply.Message("Please choose one strategy")
+		} else {
+			reply.Message("No strategy supports Get Protective Stop")
+		}
+		return nil
+	}).Next(func(signature string, reply interact.Reply) error {
+		strategy, ok := it.exchangeStrategies[signature]
+		if !ok {
+			reply.Message("Strategy not found")
+			return fmt.Errorf("strategy %s not found", signature)
+		}
+
+		r := reflect.ValueOf(strategy).Elem()
+		f := r.FieldByName("ExitMethods")
+		stopLossReader, implemented := f.Interface().(ExitMethodSet)
+		position, implemented2 := f.Interface().(*types.Position)
+		if !implemented || !implemented2 {
+			reply.Message(fmt.Sprintf("Strategy %s does not support Get Protective Stop", signature))
+			return fmt.Errorf("strategy %s does not implement Get Protective Stop", signature)
+		}
+
+		for i := range stopLossReader {
+			if stopLossReader[i].ProtectiveStopLoss != nil {
+				reply.Message(fmt.Sprintf("ProtectiveStopLoss %d: activation price@%v, stop price@%v", i, stopLossReader[i].ProtectiveStopLoss.GetActivationPrice(position), stopLossReader[i].ProtectiveStopLoss.GetStopPrice()))
+			}
+		}
+
+		return nil
+	})
 }
 
 func (it *CoreInteraction) Initialize() error {

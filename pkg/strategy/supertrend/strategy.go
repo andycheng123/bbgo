@@ -22,7 +22,6 @@ const ID = "supertrend"
 
 var log = logrus.WithField("strategy", ID)
 
-// TODO: limit order for ATR TP
 func init() {
 	// Register the pointer of the strategy struct,
 	// so that bbgo knows what struct to be used to unmarshal the configs (YAML or JSON)
@@ -405,6 +404,13 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 	}
 
 	session.MarketDataStream.OnKLineClosed(types.KLineWith(s.Symbol, s.Interval, func(kline types.KLine) {
+		// exits test
+		for i := range s.ExitMethods {
+			if s.ExitMethods[i].ProtectiveStopLoss != nil {
+				log.Debugf("ProtectiveStopLoss %d: close price@%v, activation price@%v, stop price@%v", i, kline.GetClose(), s.ExitMethods[i].ProtectiveStopLoss.GetActivationPrice(s.Position), s.ExitMethods[i].ProtectiveStopLoss.GetStopPrice())
+			}
+		}
+
 		// StrategyController
 		if s.Status != types.StrategyStatusRunning {
 			return

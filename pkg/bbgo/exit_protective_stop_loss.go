@@ -192,3 +192,19 @@ func (s *ProtectiveStopLoss) checkStopPrice(closePrice fixedpoint.Value, positio
 		}
 	}
 }
+
+func (s *ProtectiveStopLoss) GetActivationPrice(position *types.Position) fixedpoint.Value {
+	if position.IsLong() {
+		r := one.Add(s.ActivationRatio)
+		return position.AverageCost.Mul(r)
+	} else if position.IsShort() {
+		r := one.Sub(s.ActivationRatio)
+		return position.AverageCost.Mul(r)
+	}
+
+	return fixedpoint.Zero
+}
+
+func (s *ProtectiveStopLoss) GetStopPrice() fixedpoint.Value {
+	return s.stopLossPrice
+}

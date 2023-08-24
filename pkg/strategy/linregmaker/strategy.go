@@ -693,6 +693,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("NeutralBollingerWindow", strconv.Itoa(s.NeutralBollinger.Window))
 			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("NeutralBollingerBandWidth", strconv.FormatFloat(s.NeutralBollinger.BandWidth, 'f', 4, 64))
 			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("Spread", strconv.FormatFloat(s.Spread.Float64(), 'f', 4, 64))
+			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("spreadWindow", strconv.Itoa(s.DynamicSpread.AmpSpread.Window))
 		}
 
 		s.ProfitStatsTracker.Bind(s.session, s.orderExecutor.TradeCollector())

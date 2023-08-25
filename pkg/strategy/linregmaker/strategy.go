@@ -694,6 +694,10 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("NeutralBollingerBandWidth", strconv.FormatFloat(s.NeutralBollinger.BandWidth, 'f', 4, 64))
 			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("Spread", strconv.FormatFloat(s.Spread.Float64(), 'f', 4, 64))
 			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("spreadWindow", strconv.Itoa(s.DynamicSpread.AmpSpread.Window))
+			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("askDomain1", strconv.FormatFloat(s.DynamicSpread.AmpSpread.AskSpreadScale.ByPercentage.LinearScale.Domain[0], 'f', 4, 64))
+			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("askDomain2", strconv.FormatFloat(s.DynamicSpread.AmpSpread.AskSpreadScale.ByPercentage.LinearScale.Domain[1], 'f', 4, 64))
+			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("askRange1", strconv.FormatFloat(s.DynamicSpread.AmpSpread.AskSpreadScale.ByPercentage.LinearScale.Range[0], 'f', 4, 64))
+			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("askRange2", strconv.FormatFloat(s.DynamicSpread.AmpSpread.AskSpreadScale.ByPercentage.LinearScale.Range[1], 'f', 4, 64))
 		}
 
 		s.ProfitStatsTracker.Bind(s.session, s.orderExecutor.TradeCollector())

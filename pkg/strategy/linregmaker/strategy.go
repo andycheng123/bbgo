@@ -698,6 +698,10 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("askDomain2", strconv.FormatFloat(s.DynamicSpread.AmpSpread.AskSpreadScale.ByPercentage.LinearScale.Domain[1], 'f', 4, 64))
 			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("askRange1", strconv.FormatFloat(s.DynamicSpread.AmpSpread.AskSpreadScale.ByPercentage.LinearScale.Range[0], 'f', 4, 64))
 			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("askRange2", strconv.FormatFloat(s.DynamicSpread.AmpSpread.AskSpreadScale.ByPercentage.LinearScale.Range[1], 'f', 4, 64))
+			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("bidDomain1", strconv.FormatFloat(s.DynamicSpread.AmpSpread.BidSpreadScale.ByPercentage.LinearScale.Domain[0], 'f', 4, 64))
+			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("bidDomain2", strconv.FormatFloat(s.DynamicSpread.AmpSpread.BidSpreadScale.ByPercentage.LinearScale.Domain[1], 'f', 4, 64))
+			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("bidRange1", strconv.FormatFloat(s.DynamicSpread.AmpSpread.BidSpreadScale.ByPercentage.LinearScale.Range[0], 'f', 4, 64))
+			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("bidRange2", strconv.FormatFloat(s.DynamicSpread.AmpSpread.BidSpreadScale.ByPercentage.LinearScale.Range[1], 'f', 4, 64))
 		}
 
 		s.ProfitStatsTracker.Bind(s.session, s.orderExecutor.TradeCollector())

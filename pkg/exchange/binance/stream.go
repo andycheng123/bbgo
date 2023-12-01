@@ -48,6 +48,7 @@ type Stream struct {
 
 	marketTradeEventCallbacks []func(e *MarketTradeEvent)
 	aggTradeEventCallbacks    []func(e *AggTradeEvent)
+	forceOrderEventCallbacks  []func(e *ForceOrderEvent)
 
 	balanceUpdateEventCallbacks           []func(event *BalanceUpdateEvent)
 	outboundAccountInfoEventCallbacks     []func(event *OutboundAccountInfoEvent)
@@ -88,6 +89,7 @@ func NewStream(ex *Exchange, client *binance.Client, futuresClient *futures.Clie
 		if ok {
 			err := f.AddUpdate(types.SliceOrderBook{
 				Symbol: e.Symbol,
+				Time:   e.EventBase.Time.Time(),
 				Bids:   e.Bids,
 				Asks:   e.Asks,
 			}, e.FirstUpdateID, e.FinalUpdateID)
@@ -125,6 +127,7 @@ func NewStream(ex *Exchange, client *binance.Client, futuresClient *futures.Clie
 	stream.OnContinuousKLineEvent(stream.handleContinuousKLineEvent)
 	stream.OnMarketTradeEvent(stream.handleMarketTradeEvent)
 	stream.OnAggTradeEvent(stream.handleAggTradeEvent)
+	stream.OnForceOrderEvent(stream.handleForceOrderEvent)
 
 	// Futures User Data Stream
 	// ===================================
@@ -149,6 +152,9 @@ func (s *Stream) handleDisconnect() {
 
 func (s *Stream) handleConnect() {
 	if !s.PublicOnly {
+		// Emit Auth before establishing the connection to prevent the caller from missing the Update data after
+		// creating the order.
+		s.EmitAuth()
 		return
 	}
 
@@ -227,6 +233,10 @@ func (s *Stream) handleMarketTradeEvent(e *MarketTradeEvent) {
 
 func (s *Stream) handleAggTradeEvent(e *AggTradeEvent) {
 	s.EmitAggTrade(e.Trade())
+}
+
+func (s *Stream) handleForceOrderEvent(e *ForceOrderEvent) {
+	s.EmitForceOrder(e.LiquidationInfo())
 }
 
 func (s *Stream) handleKLineEvent(e *KLineEvent) {
@@ -373,6 +383,9 @@ func (s *Stream) dispatchEvent(e interface{}) {
 
 	case *ListenKeyExpired:
 		s.EmitListenKeyExpired(e)
+
+	case *ForceOrderEvent:
+		s.EmitForceOrderEvent(e)
 
 	case *MarginCallEvent:
 

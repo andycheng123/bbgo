@@ -73,6 +73,7 @@ func (s *Stream) handleOrderBookL2Event(e *WebSocketOrderBookL2Event) {
 	if ok {
 		f.AddUpdate(types.SliceOrderBook{
 			Symbol: toGlobalSymbol(e.Symbol),
+			Time:   e.Time.Time(),
 			Bids:   e.Changes.Bids,
 			Asks:   e.Changes.Asks,
 		}, e.SequenceStart, e.SequenceEnd)
@@ -177,6 +178,9 @@ func (s *Stream) handleConnect() {
 			return
 		}
 	} else {
+		// Emit Auth before establishing the connection to prevent the caller from missing the Update data after
+		// creating the order.
+		s.EmitAuth()
 		id := time.Now().UnixNano() / int64(time.Millisecond)
 		cmds := []WebSocketCommand{
 			{

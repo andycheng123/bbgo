@@ -27,12 +27,28 @@ var defaultDialer = &websocket.Dialer{
 type Stream interface {
 	StandardStreamEventHub
 
+	// Subscribe subscribes the specific channel, but not connect to the server.
 	Subscribe(channel Channel, symbol string, options SubscribeOptions)
 	GetSubscriptions() []Subscription
+	// Resubscribe used to update or renew existing subscriptions. It will reconnect to the server.
+	Resubscribe(func(oldSubs []Subscription) (newSubs []Subscription, err error)) error
+	// SetPublicOnly connects to public or private
 	SetPublicOnly()
 	GetPublicOnly() bool
+
+	// Connect connects to websocket server
 	Connect(ctx context.Context) error
+	Reconnect()
 	Close() error
+}
+
+type PrivateChannelSetter interface {
+	SetPrivateChannels(channels []string)
+}
+
+type Unsubscriber interface {
+	// Unsubscribe unsubscribes the all subscriptions.
+	Unsubscribe()
 }
 
 type EndpointCreator func(ctx context.Context) (string, error)
@@ -68,6 +84,11 @@ type StandardStream struct {
 
 	PublicOnly bool
 
+	// sg is used to wait until the previous routines are closed.
+	// only handle routines used internally, avoid including external callback func to prevent issues if they have
+	// bugs and cannot terminate. e.q. heartBeat
+	sg SyncGroup
+
 	// ReconnectC is a signal channel for reconnecting
 	ReconnectC chan struct{}
 
@@ -76,11 +97,19 @@ type StandardStream struct {
 
 	Subscriptions []Subscription
 
+	// subLock is used for locking Subscriptions fields.
+	// When changing these field values, be sure to call subLock
+	subLock sync.Mutex
+
 	startCallbacks []func()
 
 	connectCallbacks []func()
 
 	disconnectCallbacks []func()
+
+	authCallbacks []func()
+
+	rawMessageCallbacks []func(raw []byte)
 
 	// private trade update callbacks
 	tradeUpdateCallbacks []func(trade Trade)
@@ -107,6 +136,8 @@ type StandardStream struct {
 
 	aggTradeCallbacks []func(trade Trade)
 
+	forceOrderCallbacks []func(info LiquidationInfo)
+
 	// Futures
 	FuturesPositionUpdateCallbacks []func(futuresPositions FuturesPositionMap)
 
@@ -122,6 +153,7 @@ type StandardStreamEmitter interface {
 	EmitStart()
 	EmitConnect()
 	EmitDisconnect()
+	EmitAuth()
 	EmitTradeUpdate(Trade)
 	EmitOrderUpdate(Order)
 	EmitBalanceSnapshot(BalanceMap)
@@ -133,6 +165,7 @@ type StandardStreamEmitter interface {
 	EmitBookSnapshot(SliceOrderBook)
 	EmitMarketTrade(Trade)
 	EmitAggTrade(Trade)
+	EmitForceOrder(LiquidationInfo)
 	EmitFuturesPositionUpdate(FuturesPositionMap)
 	EmitFuturesPositionSnapshot(FuturesPositionMap)
 }
@@ -141,6 +174,7 @@ func NewStandardStream() StandardStream {
 	return StandardStream{
 		ReconnectC: make(chan struct{}, 1),
 		CloseC:     make(chan struct{}),
+		sg:         NewSyncGroup(),
 	}
 }
 
@@ -169,9 +203,10 @@ func (s *StandardStream) SetConn(ctx context.Context, conn *websocket.Conn) (con
 	connCtx, connCancel := context.WithCancel(ctx)
 	s.ConnLock.Lock()
 
-	// ensure the previous context is cancelled
+	// ensure the previous context is cancelled and all routines are closed.
 	if s.ConnCancel != nil {
 		s.ConnCancel()
+		s.sg.WaitAndClear()
 	}
 
 	// create a new context for this connection
@@ -208,12 +243,12 @@ func (s *StandardStream) Read(ctx context.Context, conn *websocket.Conn, cancel 
 			mt, message, err := conn.ReadMessage()
 			if err != nil {
 				// if it's a network timeout error, we should re-connect
-				switch err := err.(type) {
+				switch err2 := err.(type) {
 
 				// if it's a websocket related error
 				case *websocket.CloseError:
-					if err.Code != websocket.CloseNormalClosure {
-						log.WithError(err).Errorf("websocket error abnormal close: %+v", err)
+					if err2.Code != websocket.CloseNormalClosure {
+						log.WithError(err2).Warnf("websocket error abnormal close: %+v", err2)
 					}
 
 					_ = conn.Close()
@@ -223,13 +258,13 @@ func (s *StandardStream) Read(ctx context.Context, conn *websocket.Conn, cancel 
 					return
 
 				case net.Error:
-					log.WithError(err).Warn("websocket read network error")
+					log.WithError(err2).Warn("websocket read network error")
 					_ = conn.Close()
 					s.Reconnect()
 					return
 
 				default:
-					log.WithError(err).Warn("unexpected websocket error")
+					log.WithError(err2).Warn("unexpected websocket error")
 					_ = conn.Close()
 					s.Reconnect()
 					return
@@ -240,6 +275,8 @@ func (s *StandardStream) Read(ctx context.Context, conn *websocket.Conn, cancel 
 			if mt != websocket.TextMessage {
 				continue
 			}
+
+			s.EmitRawMessage(message)
 
 			if debugRawMessage {
 				log.Info(string(message))
@@ -261,7 +298,9 @@ func (s *StandardStream) Read(ctx context.Context, conn *websocket.Conn, cancel 
 	}
 }
 
-func (s *StandardStream) ping(ctx context.Context, conn *websocket.Conn, cancel context.CancelFunc, interval time.Duration) {
+func (s *StandardStream) ping(
+	ctx context.Context, conn *websocket.Conn, cancel context.CancelFunc, interval time.Duration,
+) {
 	defer func() {
 		cancel()
 		log.Debug("[websocket] ping worker stopped")
@@ -290,10 +329,34 @@ func (s *StandardStream) ping(ctx context.Context, conn *websocket.Conn, cancel 
 }
 
 func (s *StandardStream) GetSubscriptions() []Subscription {
+	s.subLock.Lock()
+	defer s.subLock.Unlock()
+
 	return s.Subscriptions
 }
 
+// Resubscribe synchronizes the new subscriptions based on the provided function.
+// The fn function takes the old subscriptions as input and returns the new subscriptions that will replace the old ones
+// in the struct then Reconnect.
+// This method is thread-safe.
+func (s *StandardStream) Resubscribe(fn func(old []Subscription) (new []Subscription, err error)) error {
+	s.subLock.Lock()
+	defer s.subLock.Unlock()
+
+	var err error
+	subs, err := fn(s.Subscriptions)
+	if err != nil {
+		return err
+	}
+	s.Subscriptions = subs
+	s.Reconnect()
+	return nil
+}
+
 func (s *StandardStream) Subscribe(channel Channel, symbol string, options SubscribeOptions) {
+	s.subLock.Lock()
+	defer s.subLock.Unlock()
+
 	s.Subscriptions = append(s.Subscriptions, Subscription{
 		Channel: channel,
 		Symbol:  symbol,
@@ -362,9 +425,16 @@ func (s *StandardStream) DialAndConnect(ctx context.Context) error {
 	connCtx, connCancel := s.SetConn(ctx, conn)
 	s.EmitConnect()
 
-	go s.Read(connCtx, conn, connCancel)
-	go s.ping(connCtx, conn, connCancel, pingInterval)
+	s.sg.Add(func() {
+		s.Read(connCtx, conn, connCancel)
+	})
+	s.sg.Add(func() {
+		s.ping(connCtx, conn, connCancel, pingInterval)
+	})
+	s.sg.Run()
+
 	if s.heartBeat != nil {
+		// not included in wg, as it is an external callback func.
 		go s.heartBeat(connCtx, conn, connCancel)
 	}
 	return nil
@@ -453,8 +523,10 @@ const (
 	DepthLevelMedium Depth = "MEDIUM"
 	DepthLevel1      Depth = "1"
 	DepthLevel5      Depth = "5"
+	DepthLevel15     Depth = "15"
 	DepthLevel20     Depth = "20"
 	DepthLevel50     Depth = "50"
+	DepthLevel200    Depth = "200"
 )
 
 type Speed string

@@ -189,6 +189,19 @@ func Test_WebSocketEventIsValid(t *testing.T) {
 		assert.NoError(t, w.IsValid())
 	})
 
+	t.Run("[unsubscribe] valid with public channel", func(t *testing.T) {
+		expRetMsg := "subscribe"
+		w := &WebSocketOpEvent{
+			Success: true,
+			RetMsg:  expRetMsg,
+			ReqId:   "",
+			ConnId:  "test-conndid",
+			Op:      WsOpTypeUnsubscribe,
+			Args:    nil,
+		}
+		assert.NoError(t, w.IsValid())
+	})
+
 	t.Run("[subscribe] valid with private channel", func(t *testing.T) {
 		w := &WebSocketOpEvent{
 			Success: true,
@@ -209,6 +222,19 @@ func Test_WebSocketEventIsValid(t *testing.T) {
 			ReqId:   "",
 			ConnId:  "test-conndid",
 			Op:      WsOpTypeSubscribe,
+			Args:    nil,
+		}
+		assert.Equal(t, fmt.Errorf("unexpected response result: %+v", w), w.IsValid())
+	})
+
+	t.Run("[unsubscribe] un-succeeds", func(t *testing.T) {
+		expRetMsg := ""
+		w := &WebSocketOpEvent{
+			Success: false,
+			RetMsg:  expRetMsg,
+			ReqId:   "",
+			ConnId:  "test-conndid",
+			Op:      WsOpTypeUnsubscribe,
 			Args:    nil,
 		}
 		assert.Equal(t, fmt.Errorf("unexpected response result: %+v", w), w.IsValid())
@@ -380,6 +406,55 @@ func TestBookEvent_OrderBook(t *testing.T) {
 
 }
 
+func TestMarketTradeEvent_Trade(t *testing.T) {
+	qty := fixedpoint.NewFromFloat(0.002289)
+	price := fixedpoint.NewFromFloat(28829.7600)
+	tradeId := uint64(2290000000068683542)
+	tradeTime := types.NewMillisecondTimestampFromInt(1691486100000)
+	event := MarketTradeEvent{
+		Timestamp:  tradeTime,
+		Symbol:     "BTCUSDT",
+		Side:       bybitapi.SideSell,
+		Quantity:   qty,
+		Price:      price,
+		Direction:  "",
+		TradeId:    strconv.FormatUint(tradeId, 10),
+		BlockTrade: false,
+	}
+	t.Run("succeeds", func(t *testing.T) {
+		expEvent := types.Trade{
+			ID:            tradeId,
+			Exchange:      types.ExchangeBybit,
+			Price:         price,
+			Quantity:      qty,
+			QuoteQuantity: price.Mul(qty),
+			Symbol:        event.Symbol,
+			Side:          types.SideTypeSell,
+			IsBuyer:       false,
+			IsMaker:       false,
+			Time:          types.Time(tradeTime.Time()),
+		}
+
+		trade, err := event.toGlobalTrade()
+		assert.NoError(t, err)
+		assert.Equal(t, expEvent, trade)
+	})
+
+	t.Run("invalid side", func(t *testing.T) {
+		newEvent := event
+		newEvent.Side = "invalid"
+		_, err := newEvent.toGlobalTrade()
+		assert.ErrorContains(t, err, "unexpected side")
+	})
+
+	t.Run("invalid trade id", func(t *testing.T) {
+		newEvent := event
+		newEvent.TradeId = "invalid"
+		_, err := newEvent.toGlobalTrade()
+		assert.ErrorContains(t, err, "unexpected trade id")
+	})
+}
+
 func Test_genTopicName(t *testing.T) {
 	exp := "orderbook.50.BTCUSDT"
 	assert.Equal(t, exp, genTopic(TopicTypeOrderBook, types.DepthLevel50, "BTCUSDT"))
@@ -524,7 +599,7 @@ func TestTradeEvent_toGlobalTrade(t *testing.T) {
 			OrderId:         fmt.Sprintf("%d", expTrade.OrderID),
 			OrderLinkId:     "1691419101980",
 			Category:        "spot",
-			Symbol:          fmt.Sprintf("%s", expTrade.Symbol),
+			Symbol:          expTrade.Symbol,
 			ExecId:          fmt.Sprintf("%d", expTrade.ID),
 			ExecPrice:       expTrade.Price,
 			ExecQty:         expTrade.Quantity,

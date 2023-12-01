@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
@@ -35,9 +36,27 @@ func getTestClientOrSkip(t *testing.T) *Stream {
 }
 
 func TestStream(t *testing.T) {
+	t.Skip()
 	s := getTestClientOrSkip(t)
 
+	symbols := []string{
+		"BTCUSDT",
+		"ETHUSDT",
+		"DOTUSDT",
+		"ADAUSDT",
+		"AAVEUSDT",
+		"APTUSDT",
+		"ATOMUSDT",
+		"AXSUSDT",
+		"BNBUSDT",
+		"SOLUSDT",
+		"DOGEUSDT",
+	}
+
 	t.Run("Auth test", func(t *testing.T) {
+		s.OnBalanceSnapshot(func(balances types.BalanceMap) {
+			t.Log("got balance snapshot", balances)
+		})
 		s.Connect(context.Background())
 		c := make(chan struct{})
 		<-c
@@ -61,12 +80,63 @@ func TestStream(t *testing.T) {
 		<-c
 	})
 
-	t.Run("wallet test", func(t *testing.T) {
+	t.Run("book test on unsubscribe and reconnect", func(t *testing.T) {
+		for _, symbol := range symbols {
+			s.Subscribe(types.BookChannel, symbol, types.SubscribeOptions{
+				Depth: types.DepthLevel50,
+			})
+		}
+
+		s.SetPublicOnly()
 		err := s.Connect(context.Background())
 		assert.NoError(t, err)
 
-		s.OnBalanceSnapshot(func(balances types.BalanceMap) {
-			t.Log("got snapshot", balances)
+		s.OnBookSnapshot(func(book types.SliceOrderBook) {
+			t.Log("got snapshot", book)
+		})
+		s.OnBookUpdate(func(book types.SliceOrderBook) {
+			t.Log("got update", book)
+		})
+
+		<-time.After(2 * time.Second)
+
+		s.Unsubscribe()
+		for _, symbol := range symbols {
+			s.Subscribe(types.BookChannel, symbol, types.SubscribeOptions{
+				Depth: types.DepthLevel50,
+			})
+		}
+
+		<-time.After(2 * time.Second)
+
+		s.Reconnect()
+
+		c := make(chan struct{})
+		<-c
+	})
+
+	t.Run("market trade test", func(t *testing.T) {
+		s.Subscribe(types.MarketTradeChannel, "BTCUSDT", types.SubscribeOptions{})
+		s.SetPublicOnly()
+		err := s.Connect(context.Background())
+		assert.NoError(t, err)
+
+		s.OnMarketTrade(func(trade types.Trade) {
+			t.Log("got update", trade)
+		})
+		c := make(chan struct{})
+		<-c
+	})
+
+	t.Run("wallet test", func(t *testing.T) {
+		s.OnAuth(func() {
+			t.Log("authenticated")
+		})
+		err := s.Connect(context.Background())
+		assert.NoError(t, err)
+
+		s.OnBalanceUpdate(func(balances types.BalanceMap) {
+			t.Log("got update", balances)
 		})
 		c := make(chan struct{})
 		<-c
@@ -182,7 +252,44 @@ func TestStream_parseWebSocketEvent(t *testing.T) {
 			UpdateId:   fixedpoint.NewFromFloat(1854104),
 			SequenceId: fixedpoint.NewFromFloat(10559247733),
 			Type:       DataTypeDelta,
+			ServerTime: types.NewMillisecondTimestampFromInt(1691130685111).Time(),
 		}, *book)
+	})
+
+	t.Run("TopicTypeMarketTrade with snapshot", func(t *testing.T) {
+		input := `{
+   "topic":"publicTrade.BTCUSDT",
+   "ts":1694348711526,
+   "type":"snapshot",
+   "data":[
+      {
+         "i":"2290000000068683805",
+         "T":1694348711524,
+         "p":"25816.27",
+         "v":"0.000083",
+         "S":"Sell",
+         "s":"BTCUSDT",
+         "BT":false
+      }
+   ]
+}`
+
+		res, err := s.parseWebSocketEvent([]byte(input))
+		assert.NoError(t, err)
+		book, ok := res.([]MarketTradeEvent)
+		assert.True(t, ok)
+		assert.Equal(t, []MarketTradeEvent{
+			{
+				Timestamp:  types.NewMillisecondTimestampFromInt(1694348711524),
+				Symbol:     "BTCUSDT",
+				Side:       bybitapi.SideSell,
+				Quantity:   fixedpoint.NewFromFloat(0.000083),
+				Price:      fixedpoint.NewFromFloat(25816.27),
+				Direction:  "",
+				TradeId:    "2290000000068683805",
+				BlockTrade: false,
+			},
+		}, book)
 	})
 
 	t.Run("TopicTypeKLine with snapshot", func(t *testing.T) {
@@ -288,6 +395,28 @@ func Test_convertSubscription(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, genTopic(TopicTypeOrderBook, types.DepthLevel1, "BTCUSDT"), res)
 	})
+	t.Run("BookChannel.DepthLevel50", func(t *testing.T) {
+		res, err := s.convertSubscription(types.Subscription{
+			Symbol:  "BTCUSDT",
+			Channel: types.BookChannel,
+			Options: types.SubscribeOptions{
+				Depth: types.DepthLevel50,
+			},
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, genTopic(TopicTypeOrderBook, types.DepthLevel50, "BTCUSDT"), res)
+	})
+	t.Run("BookChannel.DepthLevel200", func(t *testing.T) {
+		res, err := s.convertSubscription(types.Subscription{
+			Symbol:  "BTCUSDT",
+			Channel: types.BookChannel,
+			Options: types.SubscribeOptions{
+				Depth: types.DepthLevel200,
+			},
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, genTopic(TopicTypeOrderBook, types.DepthLevel200, "BTCUSDT"), res)
+	})
 	t.Run("BookChannel. with default depth", func(t *testing.T) {
 		res, err := s.convertSubscription(types.Subscription{
 			Symbol:  "BTCUSDT",
@@ -327,6 +456,16 @@ func Test_convertSubscription(t *testing.T) {
 		assert.Equal(t, fmt.Errorf("unsupported stream channel: %s", "unsupported"), err)
 		assert.Equal(t, "", res)
 	})
+
+	t.Run("MarketTradeChannel", func(t *testing.T) {
+		res, err := s.convertSubscription(types.Subscription{
+			Symbol:  "BTCUSDT",
+			Channel: types.MarketTradeChannel,
+			Options: types.SubscribeOptions{},
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, genTopic(TopicTypeMarketTrade, "BTCUSDT"), res)
+	})
 }
 
 func TestStream_getFeeRate(t *testing.T) {
@@ -336,9 +475,9 @@ func TestStream_getFeeRate(t *testing.T) {
 	unknownErr := errors.New("unknown err")
 
 	t.Run("succeeds", func(t *testing.T) {
-		mockMarketProvider := mocks.NewMockMarketInfoProvider(mockCtrl)
+		mockMarketProvider := mocks.NewMockStreamDataProvider(mockCtrl)
 		s := &Stream{
-			marketProvider: mockMarketProvider,
+			streamDataProvider: mockMarketProvider,
 		}
 
 		ctx := context.Background()
@@ -396,9 +535,9 @@ func TestStream_getFeeRate(t *testing.T) {
 	})
 
 	t.Run("failed to query markets", func(t *testing.T) {
-		mockMarketProvider := mocks.NewMockMarketInfoProvider(mockCtrl)
+		mockMarketProvider := mocks.NewMockStreamDataProvider(mockCtrl)
 		s := &Stream{
-			marketProvider: mockMarketProvider,
+			streamDataProvider: mockMarketProvider,
 		}
 
 		ctx := context.Background()
@@ -431,9 +570,9 @@ func TestStream_getFeeRate(t *testing.T) {
 	})
 
 	t.Run("failed to get fee rates", func(t *testing.T) {
-		mockMarketProvider := mocks.NewMockMarketInfoProvider(mockCtrl)
+		mockMarketProvider := mocks.NewMockStreamDataProvider(mockCtrl)
 		s := &Stream{
-			marketProvider: mockMarketProvider,
+			streamDataProvider: mockMarketProvider,
 		}
 
 		ctx := context.Background()

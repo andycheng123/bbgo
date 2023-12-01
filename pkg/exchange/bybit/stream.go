@@ -11,6 +11,7 @@ import (
 
 	"github.com/c9s/bbgo/pkg/exchange/bybit/bybitapi"
 	"github.com/c9s/bbgo/pkg/types"
+	"github.com/c9s/bbgo/pkg/util"
 )
 
 const (
@@ -27,35 +28,47 @@ var (
 	wsAuthRequest = 10 * time.Second
 )
 
-//go:generate mockgen -destination=mocks/stream.go -package=mocks . MarketInfoProvider
+// MarketInfoProvider calculates trade fees since trading fees are not supported by streaming.
 type MarketInfoProvider interface {
 	GetAllFeeRates(ctx context.Context) (bybitapi.FeeRates, error)
 	QueryMarkets(ctx context.Context) (types.MarketMap, error)
+}
+
+// AccountBalanceProvider provides a function to query all balances at streaming connected and emit balance snapshot.
+type AccountBalanceProvider interface {
+	QueryAccountBalances(ctx context.Context) (types.BalanceMap, error)
+}
+
+//go:generate mockgen -destination=mocks/stream.go -package=mocks . StreamDataProvider
+type StreamDataProvider interface {
+	MarketInfoProvider
+	AccountBalanceProvider
 }
 
 //go:generate callbackgen -type Stream
 type Stream struct {
 	types.StandardStream
 
-	key, secret    string
-	marketProvider MarketInfoProvider
+	key, secret        string
+	streamDataProvider StreamDataProvider
 	// TODO: update the fee rate at 7:00 am UTC; rotation required.
 	symbolFeeDetails map[string]*symbolFeeDetail
 
-	bookEventCallbacks   []func(e BookEvent)
-	walletEventCallbacks []func(e []bybitapi.WalletBalances)
-	kLineEventCallbacks  []func(e KLineEvent)
-	orderEventCallbacks  []func(e []OrderEvent)
-	tradeEventCallbacks  []func(e []TradeEvent)
+	bookEventCallbacks        []func(e BookEvent)
+	marketTradeEventCallbacks []func(e []MarketTradeEvent)
+	walletEventCallbacks      []func(e []bybitapi.WalletBalances)
+	kLineEventCallbacks       []func(e KLineEvent)
+	orderEventCallbacks       []func(e []OrderEvent)
+	tradeEventCallbacks       []func(e []TradeEvent)
 }
 
-func NewStream(key, secret string, marketProvider MarketInfoProvider) *Stream {
+func NewStream(key, secret string, userDataProvider StreamDataProvider) *Stream {
 	stream := &Stream{
 		StandardStream: types.NewStandardStream(),
 		// pragma: allowlist nextline secret
-		key:            key,
-		secret:         secret,
-		marketProvider: marketProvider,
+		key:                key,
+		secret:             secret,
+		streamDataProvider: userDataProvider,
 	}
 
 	stream.SetEndpointCreator(stream.createEndpoint)
@@ -64,13 +77,61 @@ func NewStream(key, secret string, marketProvider MarketInfoProvider) *Stream {
 	stream.SetHeartBeat(stream.ping)
 	stream.SetBeforeConnect(stream.getAllFeeRates)
 	stream.OnConnect(stream.handlerConnect)
+	stream.OnAuth(stream.handleAuthEvent)
 
 	stream.OnBookEvent(stream.handleBookEvent)
+	stream.OnMarketTradeEvent(stream.handleMarketTradeEvent)
 	stream.OnKLineEvent(stream.handleKLineEvent)
 	stream.OnWalletEvent(stream.handleWalletEvent)
 	stream.OnOrderEvent(stream.handleOrderEvent)
 	stream.OnTradeEvent(stream.handleTradeEvent)
 	return stream
+}
+
+func (s *Stream) syncSubscriptions(opType WsOpType) error {
+	if opType != WsOpTypeUnsubscribe && opType != WsOpTypeSubscribe {
+		return fmt.Errorf("unexpected subscription type: %v", opType)
+	}
+
+	logger := log.WithField("opType", opType)
+	lens := len(s.Subscriptions)
+	for begin := 0; begin < lens; begin += spotArgsLimit {
+		end := begin + spotArgsLimit
+		if end > lens {
+			end = lens
+		}
+
+		topics := []string{}
+		for _, subscription := range s.Subscriptions[begin:end] {
+			topic, err := s.convertSubscription(subscription)
+			if err != nil {
+				logger.WithError(err).Errorf("convert error, subscription: %+v", subscription)
+				return err
+			}
+
+			topics = append(topics, topic)
+		}
+
+		logger.Infof("%s channels: %+v", opType, topics)
+		if err := s.Conn.WriteJSON(WebsocketOp{
+			Op:   opType,
+			Args: topics,
+		}); err != nil {
+			logger.WithError(err).Error("failed to send request")
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s *Stream) Unsubscribe() {
+	// errors are handled in the syncSubscriptions, so they are skipped here.
+	_ = s.syncSubscriptions(WsOpTypeUnsubscribe)
+	s.Resubscribe(func(old []types.Subscription) (new []types.Subscription, err error) {
+		// clear the subscriptions
+		return []types.Subscription{}, nil
+	})
 }
 
 func (s *Stream) createEndpoint(_ context.Context) (string, error) {
@@ -89,9 +150,15 @@ func (s *Stream) dispatchEvent(event interface{}) {
 		if err := e.IsValid(); err != nil {
 			log.Errorf("invalid event: %v", err)
 		}
+		if e.IsAuthenticated() {
+			s.EmitAuth()
+		}
 
 	case *BookEvent:
 		s.EmitBookEvent(*e)
+
+	case []MarketTradeEvent:
+		s.EmitMarketTradeEvent(e)
 
 	case []bybitapi.WalletBalances:
 		s.EmitWalletEvent(e)
@@ -127,17 +194,28 @@ func (s *Stream) parseWebSocketEvent(in []byte) (interface{}, error) {
 			var book BookEvent
 			err = json.Unmarshal(e.WebSocketTopicEvent.Data, &book)
 			if err != nil {
-				return nil, fmt.Errorf("failed to unmarshal data into BookEvent: %+v, : %w", string(e.WebSocketTopicEvent.Data), err)
+				return nil, fmt.Errorf("failed to unmarshal data into BookEvent: %+v, err: %w", string(e.WebSocketTopicEvent.Data), err)
 			}
 
 			book.Type = e.WebSocketTopicEvent.Type
+			book.ServerTime = e.WebSocketTopicEvent.Ts.Time()
 			return &book, nil
+
+		case TopicTypeMarketTrade:
+			// snapshot only
+			var trade []MarketTradeEvent
+			err = json.Unmarshal(e.WebSocketTopicEvent.Data, &trade)
+			if err != nil {
+				return nil, fmt.Errorf("failed to unmarshal data into MarketTradeEvent: %+v, err: %w", string(e.WebSocketTopicEvent.Data), err)
+			}
+
+			return trade, nil
 
 		case TopicTypeKLine:
 			var kLines []KLine
 			err = json.Unmarshal(e.WebSocketTopicEvent.Data, &kLines)
 			if err != nil {
-				return nil, fmt.Errorf("failed to unmarshal data into KLine: %+v, : %w", string(e.WebSocketTopicEvent.Data), err)
+				return nil, fmt.Errorf("failed to unmarshal data into KLine: %+v, err: %w", string(e.WebSocketTopicEvent.Data), err)
 			}
 
 			symbol, err := getSymbolFromTopic(e.Topic)
@@ -204,34 +282,8 @@ func (s *Stream) ping(ctx context.Context, conn *websocket.Conn, cancelFunc cont
 
 func (s *Stream) handlerConnect() {
 	if s.PublicOnly {
-		if len(s.Subscriptions) == 0 {
-			log.Debug("no subscriptions")
-			return
-		}
-
-		var topics []string
-
-		for _, subscription := range s.Subscriptions {
-			topic, err := s.convertSubscription(subscription)
-			if err != nil {
-				log.WithError(err).Errorf("subscription convert error")
-				continue
-			}
-
-			topics = append(topics, topic)
-		}
-		if len(topics) > spotArgsLimit {
-			log.Debugf("topics exceeds limit: %d, drop of: %v", spotArgsLimit, topics[spotArgsLimit:])
-			topics = topics[:spotArgsLimit]
-		}
-		log.Infof("subscribing channels: %+v", topics)
-		if err := s.Conn.WriteJSON(WebsocketOp{
-			Op:   WsOpTypeSubscribe,
-			Args: topics,
-		}); err != nil {
-			log.WithError(err).Error("failed to send subscription request")
-			return
-		}
+		// errors are handled in the syncSubscriptions, so they are skipped here.
+		_ = s.syncSubscriptions(WsOpTypeSubscribe)
 	} else {
 		expires := strconv.FormatInt(time.Now().Add(wsAuthRequest).In(time.UTC).UnixMilli(), 10)
 
@@ -266,10 +318,17 @@ func (s *Stream) convertSubscription(sub types.Subscription) (string, error) {
 
 	case types.BookChannel:
 		depth := types.DepthLevel1
-		if len(sub.Options.Depth) > 0 && sub.Options.Depth == types.DepthLevel50 {
-			depth = types.DepthLevel50
+
+		switch sub.Options.Depth {
+		case types.DepthLevel50:
+			depth = sub.Options.Depth
+		case types.DepthLevel200:
+			depth = sub.Options.Depth
 		}
 		return genTopic(TopicTypeOrderBook, depth, sub.Symbol), nil
+
+	case types.MarketTradeChannel:
+		return genTopic(TopicTypeMarketTrade, sub.Symbol), nil
 
 	case types.KLineChannel:
 		interval, err := toLocalInterval(sub.Options.Interval)
@@ -282,6 +341,26 @@ func (s *Stream) convertSubscription(sub types.Subscription) (string, error) {
 	}
 
 	return "", fmt.Errorf("unsupported stream channel: %s", sub.Channel)
+}
+
+func (s *Stream) handleAuthEvent() {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var balnacesMap types.BalanceMap
+	var err error
+	err = util.Retry(ctx, 10, 300*time.Millisecond, func() error {
+		balnacesMap, err = s.streamDataProvider.QueryAccountBalances(ctx)
+		return err
+	}, func(err error) {
+		log.WithError(err).Error("failed to call query account balances")
+	})
+	if err != nil {
+		log.WithError(err).Error("no more attempts to retrieve balances")
+		return
+	}
+
+	s.EmitBalanceSnapshot(balnacesMap)
 }
 
 func (s *Stream) handleBookEvent(e BookEvent) {
@@ -297,8 +376,20 @@ func (s *Stream) handleBookEvent(e BookEvent) {
 	}
 }
 
+func (s *Stream) handleMarketTradeEvent(events []MarketTradeEvent) {
+	for _, event := range events {
+		trade, err := event.toGlobalTrade()
+		if err != nil {
+			log.WithError(err).Error("failed to convert to market trade")
+			continue
+		}
+
+		s.StandardStream.EmitMarketTrade(trade)
+	}
+}
+
 func (s *Stream) handleWalletEvent(events []bybitapi.WalletBalances) {
-	s.StandardStream.EmitBalanceSnapshot(toGlobalBalanceMap(events))
+	s.StandardStream.EmitBalanceUpdate(toGlobalBalanceMap(events))
 }
 
 func (s *Stream) handleOrderEvent(events []OrderEvent) {
@@ -363,7 +454,7 @@ type symbolFeeDetail struct {
 // getAllFeeRates retrieves all fee rates from the Bybit API and then fetches markets to ensure the base coin and quote coin
 // are correct.
 func (e *Stream) getAllFeeRates(ctx context.Context) error {
-	feeRates, err := e.marketProvider.GetAllFeeRates(ctx)
+	feeRates, err := e.streamDataProvider.GetAllFeeRates(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to call get fee rates: %w", err)
 	}
@@ -375,7 +466,7 @@ func (e *Stream) getAllFeeRates(ctx context.Context) error {
 		}
 	}
 
-	mkts, err := e.marketProvider.QueryMarkets(ctx)
+	mkts, err := e.streamDataProvider.QueryMarkets(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get markets: %w", err)
 	}

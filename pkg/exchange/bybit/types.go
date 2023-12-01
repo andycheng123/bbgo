@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/c9s/bbgo/pkg/exchange/bybit/bybitapi"
 	"github.com/c9s/bbgo/pkg/fixedpoint"
@@ -28,10 +29,11 @@ func (w *WsEvent) IsTopic() bool {
 type WsOpType string
 
 const (
-	WsOpTypePing      WsOpType = "ping"
-	WsOpTypePong      WsOpType = "pong"
-	WsOpTypeAuth      WsOpType = "auth"
-	WsOpTypeSubscribe WsOpType = "subscribe"
+	WsOpTypePing        WsOpType = "ping"
+	WsOpTypePong        WsOpType = "pong"
+	WsOpTypeAuth        WsOpType = "auth"
+	WsOpTypeSubscribe   WsOpType = "subscribe"
+	WsOpTypeUnsubscribe WsOpType = "unsubscribe"
 )
 
 type WebsocketOp struct {
@@ -72,19 +74,33 @@ func (w *WebSocketOpEvent) IsValid() error {
 			return fmt.Errorf("unexpected response result: %+v", w)
 		}
 		return nil
+
+	case WsOpTypeUnsubscribe:
+		// in the public channel, you can get RetMsg = 'subscribe', but in the private channel, you cannot.
+		// so, we only verify that success is true.
+		if !w.Success {
+			return fmt.Errorf("unexpected response result: %+v", w)
+		}
+		return nil
+
 	default:
 		return fmt.Errorf("unexpected op type: %+v", w)
 	}
 }
 
+func (w *WebSocketOpEvent) IsAuthenticated() bool {
+	return w.Op == WsOpTypeAuth && w.Success
+}
+
 type TopicType string
 
 const (
-	TopicTypeOrderBook TopicType = "orderbook"
-	TopicTypeWallet    TopicType = "wallet"
-	TopicTypeOrder     TopicType = "order"
-	TopicTypeKLine     TopicType = "kline"
-	TopicTypeTrade     TopicType = "execution"
+	TopicTypeOrderBook   TopicType = "orderbook"
+	TopicTypeMarketTrade TopicType = "publicTrade"
+	TopicTypeWallet      TopicType = "wallet"
+	TopicTypeOrder       TopicType = "order"
+	TopicTypeKLine       TopicType = "kline"
+	TopicTypeTrade       TopicType = "execution"
 )
 
 type DataType string
@@ -117,15 +133,65 @@ type BookEvent struct {
 	SequenceId fixedpoint.Value `json:"seq"`
 
 	// internal use
-	// Type can be one of snapshot or delta. Copied from WebSocketTopicEvent.Type
+	// Copied from WebSocketTopicEvent.Type, WebSocketTopicEvent.Ts
+	// Type can be one of snapshot or delta.
 	Type DataType
+	// ServerTime using the websocket timestamp as server time. Since the event not provide server time information.
+	ServerTime time.Time
 }
 
 func (e *BookEvent) OrderBook() (snapshot types.SliceOrderBook) {
 	snapshot.Symbol = e.Symbol
 	snapshot.Bids = e.Bids
 	snapshot.Asks = e.Asks
+	snapshot.Time = e.ServerTime
 	return snapshot
+}
+
+type MarketTradeEvent struct {
+	// Timestamp is the timestamp (ms) that the order is filled
+	Timestamp types.MillisecondTimestamp `json:"T"`
+	Symbol    string                     `json:"s"`
+	// Side of taker. Buy,Sell
+	Side bybitapi.Side `json:"S"`
+	// Quantity is the trade size
+	Quantity fixedpoint.Value `json:"v"`
+	// Price is the trade price
+	Price fixedpoint.Value `json:"p"`
+	// L is the direction of price change. Unique field for future
+	Direction string `json:"L"`
+	// trade ID
+	TradeId string `json:"i"`
+	// Whether it is a block trade order or not
+	BlockTrade bool `json:"BT"`
+}
+
+func (m *MarketTradeEvent) toGlobalTrade() (types.Trade, error) {
+	tradeId, err := strconv.ParseUint(m.TradeId, 10, 64)
+	if err != nil {
+		return types.Trade{}, fmt.Errorf("unexpected trade id: %s, err: %w", m.TradeId, err)
+	}
+
+	side, err := toGlobalSideType(m.Side)
+	if err != nil {
+		return types.Trade{}, err
+	}
+
+	return types.Trade{
+		ID:            tradeId,
+		OrderID:       0, // not supported
+		Exchange:      types.ExchangeBybit,
+		Price:         m.Price,
+		Quantity:      m.Quantity,
+		QuoteQuantity: m.Price.Mul(m.Quantity),
+		Symbol:        m.Symbol,
+		Side:          side,
+		IsBuyer:       side == types.SideTypeBuy,
+		IsMaker:       false, // not supported
+		Time:          types.Time(m.Timestamp.Time()),
+		Fee:           fixedpoint.Zero, // not supported
+		FeeCurrency:   "",              // not supported
+	}, nil
 }
 
 const topicSeparator = "."

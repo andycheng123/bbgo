@@ -34,6 +34,26 @@ func (s *StandardStream) EmitDisconnect() {
 	}
 }
 
+func (s *StandardStream) OnAuth(cb func()) {
+	s.authCallbacks = append(s.authCallbacks, cb)
+}
+
+func (s *StandardStream) EmitAuth() {
+	for _, cb := range s.authCallbacks {
+		cb()
+	}
+}
+
+func (s *StandardStream) OnRawMessage(cb func(raw []byte)) {
+	s.rawMessageCallbacks = append(s.rawMessageCallbacks, cb)
+}
+
+func (s *StandardStream) EmitRawMessage(raw []byte) {
+	for _, cb := range s.rawMessageCallbacks {
+		cb(raw)
+	}
+}
+
 func (s *StandardStream) OnTradeUpdate(cb func(trade Trade)) {
 	s.tradeUpdateCallbacks = append(s.tradeUpdateCallbacks, cb)
 }
@@ -144,6 +164,16 @@ func (s *StandardStream) EmitAggTrade(trade Trade) {
 	}
 }
 
+func (s *StandardStream) OnForceOrder(cb func(info LiquidationInfo)) {
+	s.forceOrderCallbacks = append(s.forceOrderCallbacks, cb)
+}
+
+func (s *StandardStream) EmitForceOrder(info LiquidationInfo) {
+	for _, cb := range s.forceOrderCallbacks {
+		cb(info)
+	}
+}
+
 func (s *StandardStream) OnFuturesPositionUpdate(cb func(futuresPositions FuturesPositionMap)) {
 	s.FuturesPositionUpdateCallbacks = append(s.FuturesPositionUpdateCallbacks, cb)
 }
@@ -171,6 +201,10 @@ type StandardStreamEventHub interface {
 
 	OnDisconnect(cb func())
 
+	OnAuth(cb func())
+
+	OnRawMessage(cb func(raw []byte))
+
 	OnTradeUpdate(cb func(trade Trade))
 
 	OnOrderUpdate(cb func(order Order))
@@ -192,6 +226,8 @@ type StandardStreamEventHub interface {
 	OnMarketTrade(cb func(trade Trade))
 
 	OnAggTrade(cb func(trade Trade))
+
+	OnForceOrder(cb func(info LiquidationInfo))
 
 	OnFuturesPositionUpdate(cb func(futuresPositions FuturesPositionMap))
 

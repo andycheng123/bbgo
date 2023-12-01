@@ -2,6 +2,7 @@ package strategy
 
 // import built-in strategies
 import (
+	_ "github.com/c9s/bbgo/pkg/strategy/atrpin"
 	_ "github.com/c9s/bbgo/pkg/strategy/audacitymaker"
 	_ "github.com/c9s/bbgo/pkg/strategy/autoborrow"
 	_ "github.com/c9s/bbgo/pkg/strategy/bollgrid"
@@ -28,6 +29,7 @@ import (
 	_ "github.com/c9s/bbgo/pkg/strategy/pivotshort"
 	_ "github.com/c9s/bbgo/pkg/strategy/pricealert"
 	_ "github.com/c9s/bbgo/pkg/strategy/pricedrop"
+	_ "github.com/c9s/bbgo/pkg/strategy/random"
 	_ "github.com/c9s/bbgo/pkg/strategy/rebalance"
 	_ "github.com/c9s/bbgo/pkg/strategy/rsicross"
 	_ "github.com/c9s/bbgo/pkg/strategy/rsmaker"
@@ -42,6 +44,7 @@ import (
 	_ "github.com/c9s/bbgo/pkg/strategy/wall"
 	_ "github.com/c9s/bbgo/pkg/strategy/xalign"
 	_ "github.com/c9s/bbgo/pkg/strategy/xbalance"
+	_ "github.com/c9s/bbgo/pkg/strategy/xfixedmaker"
 	_ "github.com/c9s/bbgo/pkg/strategy/xfunding"
 	_ "github.com/c9s/bbgo/pkg/strategy/xgap"
 	_ "github.com/c9s/bbgo/pkg/strategy/xmaker"

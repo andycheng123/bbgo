@@ -376,6 +376,9 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("stopByReversedSupertrend", strconv.FormatBool(s.StopByReversedSupertrend))
 			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("stopByReversedDema", strconv.FormatBool(s.StopByReversedDema))
 			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("stopByReversedLinGre", strconv.FormatBool(s.StopByReversedLinGre))
+			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("higherHighLowerLowStopLossWindow", strconv.Itoa(s.ExitMethods[1].HigherHighLowerLowStop.Window))
+			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("higherHighLowerLowStopLossHighLowWindow", strconv.Itoa(s.ExitMethods[1].HigherHighLowerLowStop.HighLowWindow))
+			s.ProfitStatsTracker.AccumulatedProfitReport.AddStrategyParameter("higherHighLowerLowStopLossMinHighLow", strconv.Itoa(s.ExitMethods[1].HigherHighLowerLowStop.MinHighLow))
 		}
 
 		s.ProfitStatsTracker.Bind(s.session, s.orderExecutor.TradeCollector())

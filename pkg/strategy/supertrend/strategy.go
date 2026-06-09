@@ -63,6 +63,9 @@ type Strategy struct {
 	// LinearRegression Use linear regression as trend confirmation
 	LinearRegression *LinReg `json:"linearRegression,omitempty"`
 
+	// EntryFilters optional veto-only entry-quality filters (nil = disabled, behaviour unchanged)
+	EntryFilters *EntryFilters `json:"entryFilters,omitempty"`
+
 	// Leverage uses the account net value to calculate the order qty
 	Leverage fixedpoint.Value `json:"leverage"`
 	// Quantity sets the fixed order qty, takes precedence over Leverage
@@ -124,12 +127,18 @@ func (s *Strategy) Validate() error {
 		return errors.New("interval is required")
 	}
 
+	if err := s.EntryFilters.Validate(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
 func (s *Strategy) Subscribe(session *bbgo.ExchangeSession) {
 	session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{Interval: s.Interval})
 	session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{Interval: s.LinearRegression.Interval})
+
+	s.EntryFilters.Subscribe(session, s.Symbol)
 
 	s.ExitMethods.SetAndSubscribe(session, s)
 
@@ -210,6 +219,9 @@ func (s *Strategy) setupIndicators() {
 			}
 		}
 	}
+
+	// Entry filters (optional, veto-only). nil receiver is a no-op.
+	s.EntryFilters.setupIndicators(s, kLineStore)
 }
 
 func (s *Strategy) shouldStop(
@@ -489,15 +501,20 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 
 		// Get order side
 		side := s.getSide(stSignal, demaSignal, lgSignal)
+
+		// Entry filters: veto-only gate on OPENING new exposure.
+		// When no filter is active, openSide == side and all downstream behaviour is unchanged.
+		openSide := s.EntryFilters.FilterOpenSide(side, kline)
+
 		// Set TP/SL price if needed
-		if side == types.SideTypeBuy {
+		if openSide == types.SideTypeBuy {
 			if s.StopLossByTriggeringK {
 				s.currentStopLossPrice = kline.GetLow()
 			}
 			if s.TakeProfitAtrMultiplier > 0 {
 				s.currentTakeProfitPrice = closePrice.Add(fixedpoint.NewFromFloat(s.Supertrend.AverageTrueRange.Last(0) * s.TakeProfitAtrMultiplier))
 			}
-		} else if side == types.SideTypeSell {
+		} else if openSide == types.SideTypeSell {
 			if s.StopLossByTriggeringK {
 				s.currentStopLossPrice = kline.GetHigh()
 			}
@@ -506,19 +523,32 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			}
 		}
 
-		// Open position
-		// The default value of side is an empty string. Unless side is set by the checks above, the result of the following condition is false
-		if side == types.SideTypeSell || side == types.SideTypeBuy {
-			bbgo.Notify("open %s position for signal %v", s.Symbol, side)
+		// Reversal close: if the raw signal reverses against an existing position but the new entry
+		// was vetoed by a filter, still close the opposite position (filters gate opening, not
+		// exiting). When no filter is active openSide == side, so this branch never runs and the
+		// behaviour is bit-identical to before.
+		if openSide == "" && side != "" {
+			if (side == types.SideTypeSell && s.Position.IsLong()) || (side == types.SideTypeBuy && s.Position.IsShort()) {
+				if !s.Market.IsDustQuantity(s.Position.GetBase().Abs(), closePrice) {
+					bbgo.Notify("%s entry vetoed by entryFilters; closing opposite position to flat", s.Symbol)
+					_ = s.ClosePosition(ctx, fixedpoint.One)
+				}
+			}
+		}
 
-			amount := s.calculateQuantity(ctx, closePrice, side)
+		// Open position
+		// The default value of openSide is an empty string. Unless openSide is set by the checks above, the result of the following condition is false
+		if openSide == types.SideTypeSell || openSide == types.SideTypeBuy {
+			bbgo.Notify("open %s position for signal %v", s.Symbol, openSide)
+
+			amount := s.calculateQuantity(ctx, closePrice, openSide)
 
 			// Add opposite position amount if any
-			if (side == types.SideTypeSell && s.Position.IsLong()) || (side == types.SideTypeBuy && s.Position.IsShort()) {
+			if (openSide == types.SideTypeSell && s.Position.IsLong()) || (openSide == types.SideTypeBuy && s.Position.IsShort()) {
 				if bbgo.IsBackTesting {
 					_ = s.ClosePosition(ctx, fixedpoint.One)
 					bbgo.Notify("close existing %s position before open a new position", s.Symbol)
-					amount = s.calculateQuantity(ctx, closePrice, side)
+					amount = s.calculateQuantity(ctx, closePrice, openSide)
 				} else {
 					bbgo.Notify("add existing opposite position amount %f of %s to the amount %f of open new position order", s.Position.GetQuantity().Float64(), s.Symbol, amount.Float64())
 					amount = amount.Add(s.Position.GetQuantity())
@@ -528,7 +558,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 				return
 			}
 
-			orderForm := s.generateOrderForm(side, amount, types.SideEffectTypeMarginBuy)
+			orderForm := s.generateOrderForm(openSide, amount, types.SideEffectTypeMarginBuy)
 			log.Infof("submit open position order %v", orderForm)
 			_, err := s.orderExecutor.SubmitOrders(ctx, orderForm)
 			if err != nil {

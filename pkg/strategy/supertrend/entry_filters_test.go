@@ -2,8 +2,10 @@ package supertrend
 
 import (
 	"testing"
+	"time"
 
 	"github.com/c9s/bbgo/pkg/fixedpoint"
+	"github.com/c9s/bbgo/pkg/indicator"
 	"github.com/c9s/bbgo/pkg/types"
 )
 
@@ -116,5 +118,119 @@ func TestEntryFiltersValidate(t *testing.T) {
 	}
 	if err := (&EntryFilters{HTFTrend: &HTFTrendFilter{Interval: types.Interval1h}}).Validate(); err != nil {
 		t.Fatalf("htfTrend with interval should validate, got %v", err)
+	}
+}
+
+// --- ADX filter ---
+
+func TestADXAllows(t *testing.T) {
+	if !adxAllows(25, 20) {
+		t.Fatal("adx 25 >= 20 should pass")
+	}
+	if adxAllows(15, 20) {
+		t.Fatal("adx 15 < 20 should veto")
+	}
+	if !adxAllows(20, 20) {
+		t.Fatal("adx 20 >= 20 should pass (boundary)")
+	}
+}
+
+func TestDIAllows(t *testing.T) {
+	if !diAllows(30, 20, types.SideTypeBuy) {
+		t.Fatal("buy with +DI>=-DI should pass")
+	}
+	if diAllows(20, 30, types.SideTypeBuy) {
+		t.Fatal("buy with +DI<-DI should veto")
+	}
+	if !diAllows(20, 30, types.SideTypeSell) {
+		t.Fatal("sell with -DI>=+DI should pass")
+	}
+	if diAllows(30, 20, types.SideTypeSell) {
+		t.Fatal("sell with -DI<+DI should veto")
+	}
+	if !diAllows(10, 10, types.SideType("")) {
+		t.Fatal("non-entry side should pass")
+	}
+}
+
+func TestADXFilterNotReadyAllows(t *testing.T) {
+	f := &ADXFilter{} // no dmi -> not ready -> allows all
+	if !f.allows(types.SideTypeBuy) || !f.allows(types.SideTypeSell) {
+		t.Fatal("not-ready ADX filter should not veto")
+	}
+}
+
+func TestADXFilterValidate(t *testing.T) {
+	if err := (&EntryFilters{ADX: &ADXFilter{}}).Validate(); err == nil {
+		t.Fatal("expected error for adx with missing interval")
+	}
+	if err := (&EntryFilters{ADX: &ADXFilter{Interval: types.Interval5m, MinADX: 20}}).Validate(); err != nil {
+		t.Fatalf("adx with interval should validate, got %v", err)
+	}
+	if err := (&EntryFilters{ADX: &ADXFilter{Interval: types.Interval5m, MinADX: -1}}).Validate(); err == nil {
+		t.Fatal("expected error for negative minADX")
+	}
+}
+
+// feedTrendingADX returns an ADXFilter whose DMI is warmed with a strong steady uptrend, which
+// yields a high ADX and +DI > -DI.
+func feedTrendingADX(window, smoothing int) *ADXFilter {
+	f := &ADXFilter{Interval: types.Interval5m, Window: window, ADXSmoothing: smoothing}
+	f.dmi = &indicator.DMI{
+		IntervalWindow: types.IntervalWindow{Interval: f.Interval, Window: window},
+		ADXSmoothing:   smoothing,
+	}
+	base := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < window*4+20; i++ {
+		p := 100.0 + float64(i)
+		var k types.KLine
+		k.High = fixedpoint.NewFromFloat(p + 0.5)
+		k.Low = fixedpoint.NewFromFloat(p - 0.5)
+		k.Close = fixedpoint.NewFromFloat(p)
+		k.EndTime = types.Time(base.Add(time.Duration(i) * 5 * time.Minute))
+		f.pushK(k)
+	}
+	return f
+}
+
+func TestADXFilterThreshold(t *testing.T) {
+	f := feedTrendingADX(14, 14)
+	if !f.ready() {
+		t.Fatal("expected DMI to be ready after warmup")
+	}
+	f.MinADX = 0
+	if !f.allows(types.SideTypeBuy) {
+		t.Fatal("MinADX=0 should allow any entry")
+	}
+	f.MinADX = 1000 // ADX is bounded ~[0,100]; an impossible threshold must veto
+	if f.allows(types.SideTypeBuy) {
+		t.Fatal("MinADX=1000 should veto (ADX cannot reach it)")
+	}
+}
+
+func TestADXFilterDIAlignment(t *testing.T) {
+	f := feedTrendingADX(14, 14)
+	f.MinADX = 0
+	f.RequireDIAlignment = true
+	if !f.allows(types.SideTypeBuy) {
+		t.Fatal("strong uptrend should allow long with DI alignment")
+	}
+	if f.allows(types.SideTypeSell) {
+		t.Fatal("strong uptrend should veto short with DI alignment")
+	}
+}
+
+func TestADXFilterPushKDedup(t *testing.T) {
+	f := feedTrendingADX(14, 14)
+	n := f.dmi.Length()
+	// re-pushing an older kline must be ignored by the end-time guard
+	var k types.KLine
+	k.High = fixedpoint.NewFromFloat(50)
+	k.Low = fixedpoint.NewFromFloat(49)
+	k.Close = fixedpoint.NewFromFloat(49.5)
+	k.EndTime = types.Time(time.Date(2019, 1, 1, 0, 0, 0, 0, time.UTC))
+	f.pushK(k)
+	if f.dmi.Length() != n {
+		t.Fatalf("stale kline should be ignored; length changed %d -> %d", n, f.dmi.Length())
 	}
 }

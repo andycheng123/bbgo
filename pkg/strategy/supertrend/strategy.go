@@ -504,17 +504,19 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 
 		// Entry filters: veto-only gate on OPENING new exposure.
 		// When no filter is active, openSide == side and all downstream behaviour is unchanged.
+		// Note: TP/SL price refresh below is keyed on the RAW side, not openSide, so a vetoed entry
+		// never affects an existing position's protective levels (filters gate opening, not exiting).
 		openSide := s.EntryFilters.FilterOpenSide(side, kline)
 
 		// Set TP/SL price if needed
-		if openSide == types.SideTypeBuy {
+		if side == types.SideTypeBuy {
 			if s.StopLossByTriggeringK {
 				s.currentStopLossPrice = kline.GetLow()
 			}
 			if s.TakeProfitAtrMultiplier > 0 {
 				s.currentTakeProfitPrice = closePrice.Add(fixedpoint.NewFromFloat(s.Supertrend.AverageTrueRange.Last(0) * s.TakeProfitAtrMultiplier))
 			}
-		} else if openSide == types.SideTypeSell {
+		} else if side == types.SideTypeSell {
 			if s.StopLossByTriggeringK {
 				s.currentStopLossPrice = kline.GetHigh()
 			}

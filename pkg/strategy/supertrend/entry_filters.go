@@ -1,9 +1,12 @@
 package supertrend
 
 import (
+	"time"
+
 	"github.com/pkg/errors"
 
 	"github.com/c9s/bbgo/pkg/bbgo"
+	"github.com/c9s/bbgo/pkg/indicator"
 	"github.com/c9s/bbgo/pkg/types"
 )
 
@@ -14,6 +17,10 @@ import (
 type EntryFilters struct {
 	// HTFTrend vetoes entries that disagree with the higher-timeframe trend direction.
 	HTFTrend *HTFTrendFilter `json:"htfTrend,omitempty"`
+
+	// ADX vetoes entries when the trend is not strong enough (ADX below a threshold), i.e. in
+	// choppy / ranging markets.
+	ADX *ADXFilter `json:"adx,omitempty"`
 }
 
 // Validate validates the filter configuration. A nil receiver is valid (filters disabled).
@@ -24,6 +31,11 @@ func (ef *EntryFilters) Validate() error {
 	if ef.HTFTrend != nil {
 		if err := ef.HTFTrend.validate(); err != nil {
 			return errors.Wrap(err, "htfTrend filter")
+		}
+	}
+	if ef.ADX != nil {
+		if err := ef.ADX.validate(); err != nil {
+			return errors.Wrap(err, "adx filter")
 		}
 	}
 	return nil
@@ -37,6 +49,9 @@ func (ef *EntryFilters) Subscribe(session *bbgo.ExchangeSession, symbol string) 
 	if ef.HTFTrend != nil {
 		session.Subscribe(types.KLineChannel, symbol, types.SubscribeOptions{Interval: ef.HTFTrend.Interval})
 	}
+	if ef.ADX != nil {
+		session.Subscribe(types.KLineChannel, symbol, types.SubscribeOptions{Interval: ef.ADX.Interval})
+	}
 }
 
 // setupIndicators initializes the indicators backing the enabled filters. A nil receiver is a no-op.
@@ -46,6 +61,9 @@ func (ef *EntryFilters) setupIndicators(s *Strategy, kLineStore *types.MarketDat
 	}
 	if ef.HTFTrend != nil {
 		ef.HTFTrend.setup(s, kLineStore)
+	}
+	if ef.ADX != nil {
+		ef.ADX.setup(s, kLineStore)
 	}
 }
 
@@ -64,6 +82,12 @@ func (ef *EntryFilters) FilterOpenSide(side types.SideType, kline types.KLine) t
 	if ef.HTFTrend != nil && !ef.HTFTrend.allows(side) {
 		ef.HTFTrend.vetoCount++
 		log.Debugf("entryFilters: htfTrend vetoed %s entry (htfTrend=%v, vetoCount=%d)", side, ef.HTFTrend.signal(), ef.HTFTrend.vetoCount)
+		return types.SideType("")
+	}
+
+	if ef.ADX != nil && !ef.ADX.allows(side) {
+		ef.ADX.vetoCount++
+		log.Debugf("entryFilters: adx vetoed %s entry (adx=%.2f, minADX=%.2f, vetoCount=%d)", side, ef.ADX.lastADX(), ef.ADX.MinADX, ef.ADX.vetoCount)
 		return types.SideType("")
 	}
 
@@ -129,6 +153,120 @@ func htfTrendAllows(trend types.Direction, side types.SideType) bool {
 		return side != types.SideTypeSell
 	case types.DirectionDown:
 		return side != types.SideTypeBuy
+	default:
+		return true
+	}
+}
+
+// ADXFilter vetoes entries when the trend is not strong enough, measured by the ADX of a DMI
+// indicator. When ADX is below MinADX (a choppy / ranging market) entries are vetoed. Optionally,
+// RequireDIAlignment also requires the directional index to agree with the entry side (+DI >= -DI
+// for longs, -DI >= +DI for shorts). While the indicator is not yet warmed up the filter does not
+// veto, to avoid cold-start false rejections.
+type ADXFilter struct {
+	// Interval is the timeframe used to measure trend strength (defaults conceptually to the
+	// strategy interval; must be set explicitly).
+	Interval types.Interval `json:"interval"`
+	// Window is the DMI window.
+	Window int `json:"window"`
+	// ADXSmoothing is the smoothing window for the ADX line.
+	ADXSmoothing int `json:"adxSmoothing"`
+	// MinADX is the threshold below which an entry is vetoed.
+	MinADX float64 `json:"minADX"`
+	// RequireDIAlignment additionally requires the directional index to agree with the entry side.
+	RequireDIAlignment bool `json:"requireDIAlignment"`
+
+	dmi        *indicator.DMI
+	dmiEndTime time.Time
+	vetoCount  int
+}
+
+func (f *ADXFilter) validate() error {
+	if len(f.Interval) == 0 {
+		return errors.New("interval is required")
+	}
+	if f.Window < 0 || f.ADXSmoothing < 0 {
+		return errors.New("window and adxSmoothing must be >= 0")
+	}
+	if f.MinADX < 0 {
+		return errors.New("minADX must be >= 0")
+	}
+	return nil
+}
+
+func (f *ADXFilter) setup(s *Strategy, kLineStore *types.MarketDataStore) {
+	if f.Window == 0 {
+		f.Window = 14
+	}
+	if f.ADXSmoothing == 0 {
+		f.ADXSmoothing = 14
+	}
+	f.dmi = &indicator.DMI{
+		IntervalWindow: types.IntervalWindow{Interval: f.Interval, Window: f.Window},
+		ADXSmoothing:   f.ADXSmoothing,
+	}
+	// DMI.PushK has no end-time guard, so wrap it to avoid double-counting the same kline across
+	// preload and live updates.
+	s.session.MarketDataStream.OnKLineClosed(types.KLineWith(s.Symbol, f.Interval, f.pushK))
+	if klines, ok := kLineStore.KLinesOfInterval(f.Interval); ok {
+		for i := range *klines {
+			f.pushK((*klines)[i])
+		}
+	}
+}
+
+// pushK feeds a kline to the DMI, skipping any kline not strictly newer than the last one processed.
+func (f *ADXFilter) pushK(k types.KLine) {
+	end := k.EndTime.Time()
+	if !f.dmiEndTime.IsZero() && !end.After(f.dmiEndTime) {
+		return
+	}
+	f.dmi.PushK(k)
+	f.dmiEndTime = end
+}
+
+// ready reports whether the DMI/ADX has enough data to produce a meaningful value.
+func (f *ADXFilter) ready() bool {
+	if f.dmi == nil || f.dmi.ADX == nil {
+		return false
+	}
+	return f.dmi.Length() >= f.Window
+}
+
+// lastADX returns the latest ADX value, or 0 if not ready.
+func (f *ADXFilter) lastADX() float64 {
+	if !f.ready() {
+		return 0
+	}
+	return f.dmi.GetADX().Last(0)
+}
+
+// allows reports whether the given entry side is permitted under the current trend strength.
+func (f *ADXFilter) allows(side types.SideType) bool {
+	if !f.ready() {
+		return true
+	}
+	if !adxAllows(f.dmi.GetADX().Last(0), f.MinADX) {
+		return false
+	}
+	if f.RequireDIAlignment {
+		return diAllows(f.dmi.GetDIPlus().Last(0), f.dmi.GetDIMinus().Last(0), side)
+	}
+	return true
+}
+
+// adxAllows is the pure trend-strength decision: an entry passes only when ADX meets the threshold.
+func adxAllows(adx, minADX float64) bool {
+	return adx >= minADX
+}
+
+// diAllows is the pure directional-index decision: longs need +DI >= -DI, shorts need -DI >= +DI.
+func diAllows(diPlus, diMinus float64, side types.SideType) bool {
+	switch side {
+	case types.SideTypeBuy:
+		return diPlus >= diMinus
+	case types.SideTypeSell:
+		return diMinus >= diPlus
 	default:
 		return true
 	}

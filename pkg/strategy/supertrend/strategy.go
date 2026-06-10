@@ -66,6 +66,9 @@ type Strategy struct {
 	// EntryFilters optional veto-only entry-quality filters (nil = disabled, behaviour unchanged)
 	EntryFilters *EntryFilters `json:"entryFilters,omitempty"`
 
+	// PartialExit optionally closes part of a position after it reaches an ATR-based target.
+	PartialExit *PartialExit `json:"partialExit,omitempty"`
+
 	// Leverage uses the account net value to calculate the order qty
 	Leverage fixedpoint.Value `json:"leverage"`
 	// Quantity sets the fixed order qty, takes precedence over Leverage
@@ -131,6 +134,10 @@ func (s *Strategy) Validate() error {
 		return err
 	}
 
+	if err := s.PartialExit.Validate(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -154,7 +161,7 @@ func (s *Strategy) CurrentPosition() *types.Position {
 	return s.Position
 }
 
-func (s *Strategy) ClosePosition(ctx context.Context, percentage fixedpoint.Value) error {
+func (s *Strategy) ClosePosition(ctx context.Context, percentage fixedpoint.Value, tags ...string) error {
 	base := s.Position.GetBase()
 	if base.IsZero() {
 		return fmt.Errorf("no opened %s position", s.Position.Symbol)
@@ -172,6 +179,9 @@ func (s *Strategy) ClosePosition(ctx context.Context, percentage fixedpoint.Valu
 	}
 
 	orderForm := s.generateOrderForm(side, quantity, types.SideEffectTypeAutoRepay)
+	if len(tags) > 0 {
+		orderForm.Tag = tags[0]
+	}
 
 	bbgo.Notify("submitting %s %s order to close position by %v", s.Symbol, side.String(), percentage, orderForm)
 
@@ -179,6 +189,10 @@ func (s *Strategy) ClosePosition(ctx context.Context, percentage fixedpoint.Valu
 	if err != nil {
 		log.WithError(err).Errorf("can not place %s position close order", s.Symbol)
 		bbgo.Notify("can not place %s position close order", s.Symbol)
+	}
+
+	if err == nil && percentage.Compare(fixedpoint.One) == 0 {
+		s.PartialExit.Reset()
 	}
 
 	return err
@@ -222,6 +236,9 @@ func (s *Strategy) setupIndicators() {
 
 	// Entry filters (optional, veto-only). nil receiver is a no-op.
 	s.EntryFilters.setupIndicators(s, kLineStore)
+
+	// Partial exit (optional). nil receiver is a no-op.
+	s.PartialExit.setupIndicators(s, kLineStore)
 }
 
 func (s *Strategy) shouldStop(
@@ -478,6 +495,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		openPrice := kline.GetOpen()
 		closePrice64 := closePrice.Float64()
 		openPrice64 := openPrice.Float64()
+		fullClosedThisBar := false
 
 		// Supertrend signal
 		stSignal := s.Supertrend.GetSignal()
@@ -496,6 +514,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			if err := s.ClosePosition(ctx, fixedpoint.One); err == nil {
 				s.currentStopLossPrice = fixedpoint.Zero
 				s.currentTakeProfitPrice = fixedpoint.Zero
+				fullClosedThisBar = true
 			}
 		}
 
@@ -533,7 +552,9 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			if (side == types.SideTypeSell && s.Position.IsLong()) || (side == types.SideTypeBuy && s.Position.IsShort()) {
 				if !s.Market.IsDustQuantity(s.Position.GetBase().Abs(), closePrice) {
 					bbgo.Notify("%s entry vetoed by entryFilters; closing opposite position to flat", s.Symbol)
-					_ = s.ClosePosition(ctx, fixedpoint.One)
+					if err := s.ClosePosition(ctx, fixedpoint.One); err == nil {
+						fullClosedThisBar = true
+					}
 				}
 			}
 		}
@@ -544,11 +565,14 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			bbgo.Notify("open %s position for signal %v", s.Symbol, openSide)
 
 			amount := s.calculateQuantity(ctx, closePrice, openSide)
+			skipOpen := false
 
 			// Add opposite position amount if any
 			if (openSide == types.SideTypeSell && s.Position.IsLong()) || (openSide == types.SideTypeBuy && s.Position.IsShort()) {
 				if bbgo.IsBackTesting {
-					_ = s.ClosePosition(ctx, fixedpoint.One)
+					if err := s.ClosePosition(ctx, fixedpoint.One); err == nil {
+						fullClosedThisBar = true
+					}
 					bbgo.Notify("close existing %s position before open a new position", s.Symbol)
 					amount = s.calculateQuantity(ctx, closePrice, openSide)
 				} else {
@@ -557,17 +581,24 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 				}
 			} else if !s.Position.IsDust(closePrice) {
 				bbgo.Notify("existing %s position has the same direction as the signal", s.Symbol)
-				return
+				skipOpen = true
 			}
 
-			orderForm := s.generateOrderForm(openSide, amount, types.SideEffectTypeMarginBuy)
-			log.Infof("submit open position order %v", orderForm)
-			_, err := s.orderExecutor.SubmitOrders(ctx, orderForm)
-			if err != nil {
-				log.WithError(err).Errorf("can not place %s open position order", s.Symbol)
-				bbgo.Notify("can not place %s open position order", s.Symbol)
+			if !skipOpen {
+				orderForm := s.generateOrderForm(openSide, amount, types.SideEffectTypeMarginBuy)
+				log.Infof("submit open position order %v", orderForm)
+				_, err := s.orderExecutor.SubmitOrders(ctx, orderForm)
+				if err != nil {
+					log.WithError(err).Errorf("can not place %s open position order", s.Symbol)
+					bbgo.Notify("can not place %s open position order", s.Symbol)
+				} else {
+					s.PartialExit.Reset()
+					s.PartialExit.Arm(kline, closePrice)
+				}
 			}
 		}
+
+		s.PartialExit.CloseIfTriggered(ctx, s, kline, closePrice, fullClosedThisBar)
 	}))
 
 	// Graceful shutdown

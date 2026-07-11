@@ -57,8 +57,12 @@ type Strategy struct {
 
 	// SuperTrend indicator
 	Supertrend *indicator.Supertrend
+	// DynamicSupertrend is used when adaptiveMultiplier is configured.
+	DynamicSupertrend *indicator.SupertrendDynamic `json:"-"`
 	// SupertrendMultiplier ATR multiplier for calculation of supertrend
 	SupertrendMultiplier float64 `json:"supertrendMultiplier"`
+	// AdaptiveMultiplier optionally adjusts the supertrend multiplier by ATR percentile rank.
+	AdaptiveMultiplier *AdaptiveMultiplierConfig `json:"adaptiveMultiplier,omitempty"`
 
 	// LinearRegression Use linear regression as trend confirmation
 	LinearRegression *LinReg `json:"linearRegression,omitempty"`
@@ -107,6 +111,18 @@ type Strategy struct {
 	bbgo.StrategyController
 }
 
+type AdaptiveMultiplierConfig struct {
+	PercentileWindow int     `json:"percentileWindow,omitempty"`
+	MLow             float64 `json:"mLow"`
+	MHigh            float64 `json:"mHigh"`
+	Polarity         string  `json:"polarity,omitempty"`
+}
+
+const (
+	adaptiveMultiplierPolarityHighVolHigh = "highVolHigh"
+	adaptiveMultiplierPolarityHighVolLow  = "highVolLow"
+)
+
 func (s *Strategy) ID() string {
 	return ID
 }
@@ -124,6 +140,12 @@ func (s *Strategy) Validate() error {
 		return errors.New("interval is required")
 	}
 
+	if s.AdaptiveMultiplier != nil {
+		if err := s.AdaptiveMultiplier.Validate(); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -139,6 +161,71 @@ func (s *Strategy) Subscribe(session *bbgo.ExchangeSession) {
 	if s.ProfitStatsTracker != nil {
 		s.ProfitStatsTracker.Subscribe(session, s.Symbol)
 	}
+}
+
+func (c *AdaptiveMultiplierConfig) Validate() error {
+	if c.PercentileWindow == 0 {
+		c.PercentileWindow = 200
+	}
+	if c.Polarity == "" {
+		c.Polarity = adaptiveMultiplierPolarityHighVolHigh
+	}
+
+	if c.MLow <= 0 {
+		return errors.New("adaptiveMultiplier.mLow must be greater than 0")
+	}
+	if c.MHigh < c.MLow {
+		return errors.New("adaptiveMultiplier.mHigh must be greater than or equal to mLow")
+	}
+	if c.PercentileWindow < 20 {
+		return errors.New("adaptiveMultiplier.percentileWindow must be greater than or equal to 20")
+	}
+	if c.Polarity != adaptiveMultiplierPolarityHighVolHigh && c.Polarity != adaptiveMultiplierPolarityHighVolLow {
+		return errors.New("adaptiveMultiplier.polarity must be highVolHigh or highVolLow")
+	}
+
+	return nil
+}
+
+func adaptiveMultiplierFromRank(rank float64, mLow float64, mHigh float64, polarity string) float64 {
+	if rank < 0 {
+		rank = 0
+	} else if rank > 1 {
+		rank = 1
+	}
+
+	if polarity == adaptiveMultiplierPolarityHighVolLow {
+		rank = 1 - rank
+	}
+
+	return mLow + (mHigh-mLow)*rank
+}
+
+func adaptiveMultiplierFromATR(atr types.Series, window int, mLow float64, mHigh float64, polarity string) float64 {
+	length := atr.Length()
+	if length == 0 {
+		return adaptiveMultiplierFromRank(0, mLow, mHigh, polarity)
+	}
+	if window <= 0 {
+		window = length
+	}
+	if length > window {
+		length = window
+	}
+	if length == 1 {
+		return adaptiveMultiplierFromRank(0, mLow, mHigh, polarity)
+	}
+
+	current := atr.Last(0)
+	less := 0
+	for i := 1; i < length; i++ {
+		if atr.Last(i) < current {
+			less++
+		}
+	}
+
+	rank := float64(less) / float64(length-1)
+	return adaptiveMultiplierFromRank(rank, mLow, mHigh, polarity)
 }
 
 // Position control
@@ -192,11 +279,22 @@ func (s *Strategy) setupIndicators() {
 	if s.SupertrendMultiplier == 0 {
 		s.SupertrendMultiplier = 3
 	}
-	s.Supertrend = &indicator.Supertrend{IntervalWindow: types.IntervalWindow{Window: s.Window, Interval: s.Interval}, ATRMultiplier: s.SupertrendMultiplier}
-	s.Supertrend.AverageTrueRange = &indicator.ATR{IntervalWindow: types.IntervalWindow{Window: s.Window, Interval: s.Interval}}
-	s.Supertrend.BindK(s.session.MarketDataStream, s.Symbol, s.Supertrend.Interval)
-	if klines, ok := kLineStore.KLinesOfInterval(s.Supertrend.Interval); ok {
-		s.Supertrend.LoadK((*klines)[0:])
+	if s.AdaptiveMultiplier == nil {
+		s.Supertrend = &indicator.Supertrend{IntervalWindow: types.IntervalWindow{Window: s.Window, Interval: s.Interval}, ATRMultiplier: s.SupertrendMultiplier}
+		s.Supertrend.AverageTrueRange = &indicator.ATR{IntervalWindow: types.IntervalWindow{Window: s.Window, Interval: s.Interval}}
+		s.Supertrend.BindK(s.session.MarketDataStream, s.Symbol, s.Supertrend.Interval)
+		if klines, ok := kLineStore.KLinesOfInterval(s.Supertrend.Interval); ok {
+			s.Supertrend.LoadK((*klines)[0:])
+		}
+	} else {
+		s.DynamicSupertrend = &indicator.SupertrendDynamic{IntervalWindow: types.IntervalWindow{Window: s.Window, Interval: s.Interval}, ATRMultiplier: s.SupertrendMultiplier}
+		s.DynamicSupertrend.AverageTrueRange = &indicator.ATR{IntervalWindow: types.IntervalWindow{Window: s.Window, Interval: s.Interval}}
+		s.session.MarketDataStream.OnKLineClosed(types.KLineWith(s.Symbol, s.DynamicSupertrend.Interval, s.pushAdaptiveSupertrendK))
+		if klines, ok := kLineStore.KLinesOfInterval(s.DynamicSupertrend.Interval); ok {
+			for _, k := range (*klines)[0:] {
+				s.pushAdaptiveSupertrendK(k)
+			}
+		}
 	}
 
 	// Linear Regression
@@ -212,6 +310,30 @@ func (s *Strategy) setupIndicators() {
 			}
 		}
 	}
+}
+
+func (s *Strategy) pushAdaptiveSupertrendK(k types.KLine) {
+	cfg := s.AdaptiveMultiplier
+	if cfg != nil {
+		if multiplier := adaptiveMultiplierFromATR(s.DynamicSupertrend.AverageTrueRange, cfg.PercentileWindow, cfg.MLow, cfg.MHigh, cfg.Polarity); multiplier > 0 {
+			s.DynamicSupertrend.SetMultiplier(multiplier)
+		}
+	}
+	s.DynamicSupertrend.PushK(k)
+}
+
+func (s *Strategy) supertrendSignal() types.Direction {
+	if s.DynamicSupertrend != nil {
+		return s.DynamicSupertrend.GetSignal()
+	}
+	return s.Supertrend.GetSignal()
+}
+
+func (s *Strategy) supertrendATR() *indicator.ATR {
+	if s.DynamicSupertrend != nil {
+		return s.DynamicSupertrend.AverageTrueRange
+	}
+	return s.Supertrend.AverageTrueRange
 }
 
 func (s *Strategy) shouldStop(
@@ -473,7 +595,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		openPrice64 := openPrice.Float64()
 
 		// Supertrend signal
-		stSignal := s.Supertrend.GetSignal()
+		stSignal := s.supertrendSignal()
 
 		// DEMA signal
 		demaSignal := s.doubleDema.getDemaSignal(openPrice64, closePrice64)
@@ -500,14 +622,14 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 				s.currentStopLossPrice = kline.GetLow()
 			}
 			if s.TakeProfitAtrMultiplier > 0 {
-				s.currentTakeProfitPrice = closePrice.Add(fixedpoint.NewFromFloat(s.Supertrend.AverageTrueRange.Last(0) * s.TakeProfitAtrMultiplier))
+				s.currentTakeProfitPrice = closePrice.Add(fixedpoint.NewFromFloat(s.supertrendATR().Last(0) * s.TakeProfitAtrMultiplier))
 			}
 		} else if side == types.SideTypeSell {
 			if s.StopLossByTriggeringK {
 				s.currentStopLossPrice = kline.GetHigh()
 			}
 			if s.TakeProfitAtrMultiplier > 0 {
-				s.currentTakeProfitPrice = closePrice.Sub(fixedpoint.NewFromFloat(s.Supertrend.AverageTrueRange.Last(0) * s.TakeProfitAtrMultiplier))
+				s.currentTakeProfitPrice = closePrice.Sub(fixedpoint.NewFromFloat(s.supertrendATR().Last(0) * s.TakeProfitAtrMultiplier))
 			}
 		}
 

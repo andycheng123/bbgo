@@ -19,6 +19,7 @@ func newTestSession(t *testing.T) *bbgo.ExchangeSession {
 
 	mockEx := mocks.NewMockExchange(mockCtrl)
 	mockEx.EXPECT().NewStream().Return(&types.StandardStream{}).Times(2)
+	mockEx.EXPECT().Name().Return(types.ExchangeName("backtest")).AnyTimes()
 
 	return bbgo.NewExchangeSession("test", mockEx)
 }

@@ -151,7 +151,11 @@ func (s *Strategy) Validate() error {
 
 func (s *Strategy) Subscribe(session *bbgo.ExchangeSession) {
 	session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{Interval: s.Interval})
-	if s.LinearRegression != nil && s.LinearRegression.Window != 0 && s.LinearRegression.Interval != "" {
+	// Panic-guard only (nil pointer / empty interval both panicked before).
+	// Degenerate configs (window==0 with an interval set) keep their historical
+	// unused subscription so backtest replay inputs stay identical to pre-fix
+	// behavior; setupIndicators still nils the indicator for them.
+	if s.LinearRegression != nil && s.LinearRegression.Interval != "" {
 		session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{Interval: s.LinearRegression.Interval})
 	}
 
@@ -201,20 +205,19 @@ func adaptiveMultiplierFromRank(rank float64, mLow float64, mHigh float64, polar
 	return mLow + (mHigh-mLow)*rank
 }
 
+// adaptiveMultiplierFromATR returns a negative value while the ATR history is
+// shorter than the percentile window (warmup): partial-sample percentiles are
+// noise-dominated, so the caller keeps the static SupertrendMultiplier until a
+// full window is available.
 func adaptiveMultiplierFromATR(atr types.Series, window int, mLow float64, mHigh float64, polarity string) float64 {
 	length := atr.Length()
-	if length == 0 {
-		return adaptiveMultiplierFromRank(0, mLow, mHigh, polarity)
-	}
 	if window <= 0 {
 		window = length
 	}
-	if length > window {
-		length = window
+	if length < window || length < 2 {
+		return -1
 	}
-	if length == 1 {
-		return adaptiveMultiplierFromRank(0, mLow, mHigh, polarity)
-	}
+	length = window
 
 	current := atr.Last(0)
 	less := 0

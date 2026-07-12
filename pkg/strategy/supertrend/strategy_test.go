@@ -7,6 +7,7 @@ import (
 
 	"github.com/c9s/bbgo/pkg/bbgo"
 	"github.com/c9s/bbgo/pkg/datatype/floats"
+	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/types"
 	"github.com/c9s/bbgo/pkg/types/mocks"
 )
@@ -95,5 +96,59 @@ func TestAdaptiveMultiplierFromATR(t *testing.T) {
 	lowCurrentATRValues := floats.Slice{5, 4, 3, 2, 1}
 	if got, want := adaptiveMultiplierFromATR(lowCurrentATRValues, 5, 2, 4, adaptiveMultiplierPolarityHighVolHigh), 2.0; got != want {
 		t.Fatalf("low current ATR multiplier = %v, want %v", got, want)
+	}
+}
+
+func TestMakerEntryConfigValidate(t *testing.T) {
+	cfg := &MakerEntryConfig{}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.TimeoutBars, 1; got != want {
+		t.Fatalf("timeoutBars = %d, want %d", got, want)
+	}
+	if got, want := cfg.PriceOffsetTicks, 0; got != want {
+		t.Fatalf("priceOffsetTicks = %d, want %d", got, want)
+	}
+
+	cfg = &MakerEntryConfig{TimeoutBars: -1}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected timeoutBars validation error")
+	}
+
+	cfg = &MakerEntryConfig{TimeoutBars: 1, PriceOffsetTicks: -1}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected priceOffsetTicks validation error")
+	}
+}
+
+func TestStrategyValidate_MakerEntryNilSafe(t *testing.T) {
+	s := &Strategy{
+		Symbol:         "BTCUSDT",
+		IntervalWindow: types.IntervalWindow{Interval: types.Interval1m, Window: 5},
+	}
+
+	if err := s.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStrategyMakerEntryLimitPrice(t *testing.T) {
+	s := &Strategy{
+		Market: types.Market{
+			TickSize: fixedpoint.MustNewFromString("0.01"),
+		},
+		MakerEntry: &MakerEntryConfig{
+			TimeoutBars:      1,
+			PriceOffsetTicks: 2,
+		},
+	}
+	closePrice := fixedpoint.MustNewFromString("100.00")
+
+	if got, want := s.makerEntryLimitPrice(types.SideTypeBuy, closePrice), fixedpoint.MustNewFromString("99.98"); got.Compare(want) != 0 {
+		t.Fatalf("buy limit price = %s, want %s", got.String(), want.String())
+	}
+	if got, want := s.makerEntryLimitPrice(types.SideTypeSell, closePrice), fixedpoint.MustNewFromString("100.02"); got.Compare(want) != 0 {
+		t.Fatalf("sell limit price = %s, want %s", got.String(), want.String())
 	}
 }

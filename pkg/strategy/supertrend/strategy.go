@@ -88,6 +88,8 @@ type Strategy struct {
 	// StopByReversedLinGre TP/SL by reversed linear regression signal
 	StopByReversedLinGre bool `json:"stopByReversedLinGre"`
 
+	MakerEntry *MakerEntryConfig `json:"makerEntry,omitempty"`
+
 	// ExitMethods Exit methods
 	ExitMethods bbgo.ExitMethodSet `json:"exits"`
 
@@ -106,9 +108,22 @@ type Strategy struct {
 	orderExecutor          *bbgo.GeneralOrderExecutor
 	currentTakeProfitPrice fixedpoint.Value
 	currentStopLossPrice   fixedpoint.Value
+	pendingEntry           *pendingEntry
 
 	// StrategyController
 	bbgo.StrategyController
+}
+
+type MakerEntryConfig struct {
+	TimeoutBars      int `json:"timeoutBars,omitempty"`
+	PriceOffsetTicks int `json:"priceOffsetTicks,omitempty"`
+}
+
+type pendingEntry struct {
+	orderID    uint64
+	side       types.SideType
+	quantity   fixedpoint.Value
+	barsWaited int
 }
 
 type AdaptiveMultiplierConfig struct {
@@ -146,6 +161,12 @@ func (s *Strategy) Validate() error {
 		}
 	}
 
+	if s.MakerEntry != nil {
+		if err := s.MakerEntry.Validate(); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -165,6 +186,20 @@ func (s *Strategy) Subscribe(session *bbgo.ExchangeSession) {
 	if s.ProfitStatsTracker != nil {
 		s.ProfitStatsTracker.Subscribe(session, s.Symbol)
 	}
+}
+
+func (c *MakerEntryConfig) Validate() error {
+	if c.TimeoutBars == 0 {
+		c.TimeoutBars = 1
+	}
+	if c.TimeoutBars < 1 {
+		return errors.New("makerEntry.timeoutBars must be greater than or equal to 1")
+	}
+	if c.PriceOffsetTicks < 0 {
+		return errors.New("makerEntry.priceOffsetTicks must be greater than or equal to 0")
+	}
+
+	return nil
 }
 
 func (c *AdaptiveMultiplierConfig) Validate() error {
@@ -400,6 +435,103 @@ func (s *Strategy) generateOrderForm(
 	return orderForm
 }
 
+func (s *Strategy) makerEntryLimitPrice(side types.SideType, closePrice fixedpoint.Value) fixedpoint.Value {
+	offset := s.Market.TickSize.Mul(fixedpoint.NewFromInt(int64(s.MakerEntry.PriceOffsetTicks)))
+	switch side {
+	case types.SideTypeBuy:
+		return s.Market.TruncatePrice(closePrice.Sub(offset))
+	case types.SideTypeSell:
+		return s.Market.TruncatePrice(closePrice.Add(offset))
+	default:
+		return s.Market.TruncatePrice(closePrice)
+	}
+}
+
+func (s *Strategy) generateEntryOrderForm(
+	side types.SideType, quantity fixedpoint.Value, closePrice fixedpoint.Value, marginOrderSideEffect types.MarginOrderSideEffectType,
+) types.SubmitOrder {
+	orderForm := s.generateOrderForm(side, quantity, marginOrderSideEffect)
+	if s.MakerEntry == nil {
+		return orderForm
+	}
+
+	orderForm.Type = types.OrderTypeLimit
+	orderForm.Price = s.makerEntryLimitPrice(side, closePrice)
+	orderForm.TimeInForce = types.TimeInForceGTC
+	return orderForm
+}
+
+func (s *Strategy) cancelPendingEntry(ctx context.Context) error {
+	if s.pendingEntry == nil {
+		return nil
+	}
+
+	order, ok := s.orderExecutor.ActiveMakerOrders().Get(s.pendingEntry.orderID)
+	if !ok {
+		s.pendingEntry = nil
+		return nil
+	}
+
+	if err := s.orderExecutor.CancelOrders(ctx, order); err != nil {
+		return err
+	}
+
+	s.pendingEntry = nil
+	return nil
+}
+
+func (s *Strategy) handlePendingEntry(ctx context.Context) (bool, error) {
+	if s.pendingEntry == nil {
+		return false, nil
+	}
+
+	order, ok := s.orderExecutor.ActiveMakerOrders().Get(s.pendingEntry.orderID)
+	if !ok || !types.IsActiveOrder(order) {
+		s.pendingEntry = nil
+		return false, nil
+	}
+
+	s.pendingEntry.barsWaited++
+	if s.pendingEntry.barsWaited < s.MakerEntry.TimeoutBars {
+		return true, nil
+	}
+
+	side := s.pendingEntry.side
+	quantity := s.pendingEntry.quantity
+	if err := s.cancelPendingEntry(ctx); err != nil {
+		return true, err
+	}
+
+	orderForm := s.generateOrderForm(side, quantity, types.SideEffectTypeMarginBuy)
+	log.Infof("submit fallback market entry order %v", orderForm)
+	if _, err := s.orderExecutor.SubmitOrders(ctx, orderForm); err != nil {
+		return true, err
+	}
+
+	return true, nil
+}
+
+func (s *Strategy) submitEntryOrder(
+	ctx context.Context, side types.SideType, quantity fixedpoint.Value, closePrice fixedpoint.Value,
+) error {
+	orderForm := s.generateEntryOrderForm(side, quantity, closePrice, types.SideEffectTypeMarginBuy)
+	log.Infof("submit open position order %v", orderForm)
+	createdOrders, err := s.orderExecutor.SubmitOrders(ctx, orderForm)
+	if err != nil {
+		return err
+	}
+
+	if s.MakerEntry != nil && len(createdOrders) > 0 && types.IsActiveOrder(createdOrders[0]) {
+		s.pendingEntry = &pendingEntry{
+			orderID:  createdOrders[0].OrderID,
+			side:     side,
+			quantity: quantity,
+		}
+	}
+
+	return nil
+}
+
 // calculateQuantity returns leveraged quantity
 func (s *Strategy) calculateQuantity(
 	ctx context.Context, currentPrice fixedpoint.Value, side types.SideType,
@@ -445,6 +577,12 @@ func (s *Strategy) CalcAssetValue(price fixedpoint.Value) fixedpoint.Value {
 
 func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, session *bbgo.ExchangeSession) error {
 	s.session = session
+
+	if s.MakerEntry != nil {
+		if err := s.MakerEntry.Validate(); err != nil {
+			return err
+		}
+	}
 
 	s.currentStopLossPrice = fixedpoint.Zero
 	s.currentTakeProfitPrice = fixedpoint.Zero
@@ -609,16 +747,47 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			lgSignal = s.LinearRegression.GetSignal()
 		}
 
+		shouldStop := !s.Market.IsDustQuantity(s.Position.GetBase().Abs(), closePrice) && s.shouldStop(kline, stSignal, demaSignal, lgSignal)
+		hadPendingEntry := s.pendingEntry != nil
+		if shouldStop && hadPendingEntry {
+			if err := s.cancelPendingEntry(ctx); err != nil {
+				log.WithError(err).Errorf("can not cancel pending %s entry order", s.Symbol)
+				bbgo.Notify("can not cancel pending %s entry order", s.Symbol)
+			}
+		}
+
 		// TP/SL if there's non-dust position and meets the criteria
-		if !s.Market.IsDustQuantity(s.Position.GetBase().Abs(), closePrice) && s.shouldStop(kline, stSignal, demaSignal, lgSignal) {
+		if shouldStop {
 			if err := s.ClosePosition(ctx, fixedpoint.One); err == nil {
 				s.currentStopLossPrice = fixedpoint.Zero
 				s.currentTakeProfitPrice = fixedpoint.Zero
+			}
+			if hadPendingEntry {
+				return
 			}
 		}
 
 		// Get order side
 		side := s.getSide(stSignal, demaSignal, lgSignal)
+		if s.pendingEntry != nil {
+			if (side == types.SideTypeSell || side == types.SideTypeBuy) && side != s.pendingEntry.side {
+				if err := s.cancelPendingEntry(ctx); err != nil {
+					log.WithError(err).Errorf("can not cancel pending %s entry order", s.Symbol)
+					bbgo.Notify("can not cancel pending %s entry order", s.Symbol)
+				}
+				return
+			}
+
+			handled, err := s.handlePendingEntry(ctx)
+			if err != nil {
+				log.WithError(err).Errorf("can not handle pending %s entry order", s.Symbol)
+				bbgo.Notify("can not handle pending %s entry order", s.Symbol)
+			}
+			if handled {
+				return
+			}
+		}
+
 		// Set TP/SL price if needed
 		if side == types.SideTypeBuy {
 			if s.StopLossByTriggeringK {
@@ -658,10 +827,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 				return
 			}
 
-			orderForm := s.generateOrderForm(side, amount, types.SideEffectTypeMarginBuy)
-			log.Infof("submit open position order %v", orderForm)
-			_, err := s.orderExecutor.SubmitOrders(ctx, orderForm)
-			if err != nil {
+			if err := s.submitEntryOrder(ctx, side, amount, closePrice); err != nil {
 				log.WithError(err).Errorf("can not place %s open position order", s.Symbol)
 				bbgo.Notify("can not place %s open position order", s.Symbol)
 			}

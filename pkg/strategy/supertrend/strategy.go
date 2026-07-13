@@ -54,6 +54,11 @@ type Strategy struct {
 	FastDEMAWindow int `json:"fastDEMAWindow"`
 	// SlowDEMAWindow DEMA window for checking breakout
 	SlowDEMAWindow int `json:"slowDEMAWindow"`
+	// DisableDema removes the double-DEMA leg from the entry consensus
+	// (signal-stack ablation; supertrend + optional linReg only). Default
+	// false keeps existing behavior, including the 144/169 defaults that
+	// zero windows imply.
+	DisableDema bool `json:"disableDema,omitempty"`
 
 	// SuperTrend indicator
 	Supertrend *indicator.Supertrend
@@ -308,7 +313,9 @@ func (s *Strategy) setupIndicators() {
 	kLineStore, _ := s.session.MarketDataStore(s.Symbol)
 
 	// Double DEMA
-	s.doubleDema = newDoubleDema(kLineStore, s.Interval, s.FastDEMAWindow, s.SlowDEMAWindow)
+	if !s.DisableDema {
+		s.doubleDema = newDoubleDema(kLineStore, s.Interval, s.FastDEMAWindow, s.SlowDEMAWindow)
+	}
 
 	// Supertrend
 	if s.Window == 0 {
@@ -411,9 +418,9 @@ func (s *Strategy) getSide(
 ) types.SideType {
 	var side types.SideType
 
-	if stSignal == types.DirectionUp && demaSignal == types.DirectionUp && (s.LinearRegression == nil || lgSignal == types.DirectionUp) {
+	if stSignal == types.DirectionUp && (s.DisableDema || demaSignal == types.DirectionUp) && (s.LinearRegression == nil || lgSignal == types.DirectionUp) {
 		side = types.SideTypeBuy
-	} else if stSignal == types.DirectionDown && demaSignal == types.DirectionDown && (s.LinearRegression == nil || lgSignal == types.DirectionDown) {
+	} else if stSignal == types.DirectionDown && (s.DisableDema || demaSignal == types.DirectionDown) && (s.LinearRegression == nil || lgSignal == types.DirectionDown) {
 		side = types.SideTypeSell
 	}
 
@@ -739,7 +746,10 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		stSignal := s.supertrendSignal()
 
 		// DEMA signal
-		demaSignal := s.doubleDema.getDemaSignal(openPrice64, closePrice64)
+		var demaSignal types.Direction = types.DirectionNone
+		if s.doubleDema != nil {
+			demaSignal = s.doubleDema.getDemaSignal(openPrice64, closePrice64)
+		}
 
 		// Linear Regression signal
 		var lgSignal types.Direction

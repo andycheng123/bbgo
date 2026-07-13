@@ -152,3 +152,19 @@ func TestStrategyMakerEntryLimitPrice(t *testing.T) {
 		t.Fatalf("sell limit price = %s, want %s", got.String(), want.String())
 	}
 }
+
+func TestGetSide_DisableDema(t *testing.T) {
+	ablated := &Strategy{DisableDema: true}
+	if got := ablated.getSide(types.DirectionUp, types.DirectionNone, types.DirectionNone); got != types.SideTypeBuy {
+		t.Fatalf("disabled DEMA buy side = %q, want buy", got)
+	}
+	if got := ablated.getSide(types.DirectionDown, types.DirectionNone, types.DirectionNone); got != types.SideTypeSell {
+		t.Fatalf("disabled DEMA sell side = %q, want sell", got)
+	}
+
+	// default behavior unchanged: DEMA alignment still required
+	baseline := &Strategy{}
+	if got := baseline.getSide(types.DirectionUp, types.DirectionNone, types.DirectionNone); got != "" {
+		t.Fatalf("baseline side = %q, want empty without DEMA alignment", got)
+	}
+}
